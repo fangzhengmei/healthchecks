@@ -12,7 +12,10 @@
 4. [邮件配置与链接生成](#邮件配置与链接生成)
 5. [静态资源配置](#静态资源配置)
 6. [安全配置、反向代理与 HTTPS Header](#安全配置反向代理与-https-header)
-7. [配置依赖关系图](#配置依赖关系图)
+7. [HTTPS Header 配置错误的连锁影响](#https-header-配置错误的连锁影响)
+8. [可落地的排查步骤](#可落地的排查步骤)
+9. [配置依赖关系图](#配置依赖关系图)
+10. [快速配置检查清单](#快速配置检查清单)
 
 ---
 
@@ -28,6 +31,7 @@ Healthchecks 的配置主要通过环境变量读取，定义在 `hc/settings.py
 | `ALLOWED_HOSTS` | SITE_ROOT 的域名部分 | 允许的主机名列表 |
 | `STATIC_URL` | SITE_ROOT path + "/static/" | 静态资源 URL 前缀 |
 | `LOGIN_URL` | SITE_ROOT path + "/accounts/login/" | 登录页面 URL |
+| `SECURE_PROXY_SSL_HEADER` | None | 反向代理 HTTPS header 配置 |
 
 ---
 
@@ -115,6 +119,7 @@ def absolute_reverse(
 **关键点**：
 - `absolute_url()` 会移除 `SITE_ROOT` 中的路径部分，然后拼接传入的 path
 - 这确保了当 `SITE_ROOT` 包含子路径时，生成的 URL 仍然正确
+- **重要**：这些函数直接使用 `settings.SITE_ROOT`，**不依赖**请求信息或 `X-Forwarded-*` header
 
 ### 使用场景
 
@@ -180,6 +185,7 @@ PING_EMAIL_DOMAIN = os.getenv("PING_EMAIL_DOMAIN", "localhost")
 这意味着：
 - 你可以将 `PING_ENDPOINT` 设置为与 `SITE_ROOT` 不同的域名（如 `https://ping.example.org/`）
 - 但你需要在反向代理中配置相应的路由规则
+- **重要**：`PING_ENDPOINT` 直接使用配置值，**不依赖** `X-Forwarded-*` header
 
 ### 使用场景
 
@@ -364,6 +370,15 @@ def absolute_site_logo_url() -> str:
 
 Logo URL 会自动转换为绝对 URL。
 
+### 关键要点
+
+**邮件中的所有链接都直接使用 `SITE_ROOT` 配置值，不依赖 `X-Forwarded-*` header。**
+
+这意味着：
+- 如果 `SITE_ROOT=http://example.com`，邮件中的链接就是 `http://...`
+- 如果 `SITE_ROOT=https://example.com`，邮件中的链接就是 `https://...`
+- 反向代理的 header 配置**不会影响**邮件中链接的协议
+
 ---
 
 ## 静态资源配置
@@ -446,6 +461,20 @@ WHITENOISE_IMMUTABLE_FILE_TEST = immutable_file_test
 
 WhiteNoise 用于高效地提供静态文件服务，并且为缓存文件和字体文件设置了不可变缓存规则。
 
+### 静态资源与 HTTPS Header 的关系
+
+静态资源的 URL 路径（`STATIC_URL`）基于 `SITE_ROOT` 派生，但**实际访问时**：
+
+1. **浏览器请求**: 浏览器通过页面中的 `<link>` 和 `<script>` 标签加载静态资源
+2. **相对路径**: 静态资源通常使用相对路径（如 `/static/css/base.css`）
+3. **协议继承**: 浏览器会使用当前页面的协议（http 或 https）来请求静态资源
+
+**关键点**：
+- `STATIC_URL` 只定义路径部分，不包含协议和域名
+- 静态资源的加载协议由页面的访问协议决定
+- 如果页面通过 https 访问，静态资源也通过 https 加载
+- 但这依赖于浏览器正确识别页面的协议
+
 ---
 
 ## 安全配置、反向代理与 HTTPS Header
@@ -471,6 +500,24 @@ SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
 
 ```python
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+```
+
+#### 这个配置的作用
+
+`SECURE_PROXY_SSL_HEADER` 是 Django 的标准配置，告诉 Django：
+
+> "当请求包含某个 header 且值为特定值时，认为这个请求是通过 HTTPS 发送的。"
+
+**工作原理**：
+
+```
+用户浏览器 --(HTTPS)--> 反向代理(Nginx) --(HTTP)--> Django(uWSGI)
+                                    ↓
+                    设置 X-Forwarded-Proto: https
+                                    ↓
+                    Django 读取 SECURE_PROXY_SSL_HEADER 配置
+                                    ↓
+                    request.is_secure() 返回 True
 ```
 
 #### 系统检查
@@ -503,7 +550,7 @@ if v is not None and (not isinstance(v, tuple) or len(v) != 2):
 
 这个 Header 用于记录客户端的真实 IP 地址。
 
-**安全警告**: 如果反向代理没有设置 `X-Forwarded-For`，客户端可以伪造自己的 IP 地址。
+**安全警告**: 如果反向代理没有设置 `X-Forwarded-For`，客户端可以伪造自己的 IP 地址，从而绕过 IP 限流等安全措施。
 
 ### Nginx 配置示例
 
@@ -516,6 +563,10 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
+
+**关键配置项**：
+- `proxy_set_header X-Forwarded-Proto $scheme;` - 将原始请求协议传递给后端
+- `proxy_set_header Host $host;` - 将原始 Host header 传递给后端
 
 ### HAProxy 配置示例
 
@@ -531,6 +582,7 @@ http-request set-header X-Forwarded-Proto http unless { ssl_fc }
 | `SECRET_KEY` | `"---"` | Django 密钥，用于加密签名 |
 | `DEBUG` | `True` | 调试模式，生产环境必须设为 False |
 | `REGISTRATION_OPEN` | `True` | 是否开放用户注册 |
+| `RP_ID` | `None` | WebAuthn 依赖方 ID（用于无密码登录） |
 
 ### SECRET_KEY 的安全加载
 
@@ -591,50 +643,734 @@ def debug_warning() -> str:
 
 ---
 
+## HTTPS Header 配置错误的连锁影响
+
+### 核心概念澄清
+
+在分析影响之前，需要明确一个**关键区别**：
+
+| 配置项 | 用途 | 依赖 |
+|--------|------|------|
+| `SITE_ROOT` | 生成绝对 URL（邮件、API 响应等） | **不依赖**请求信息 |
+| `SECURE_PROXY_SSL_HEADER` | 告诉 Django 如何判断请求是否为 HTTPS | 依赖 `X-Forwarded-*` header |
+| `PING_ENDPOINT` | 显示 ping URL | **不依赖**请求信息 |
+
+**这是一个非常重要的区别**：
+- `SITE_ROOT` 和 `PING_ENDPOINT` 是**静态配置**，应用启动时确定
+- 邮件链接、API 响应中的 URL 直接使用这些配置值
+- `X-Forwarded-*` header 只影响**当前请求**的处理逻辑
+
+### 配置错误的场景分类
+
+#### 场景 1: SITE_ROOT 协议错误（http vs https）
+
+**配置示例**：
+```bash
+# 错误：用户通过 https 访问，但 SITE_ROOT 用的是 http
+SITE_ROOT=http://hc.example.com
+SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
+```
+
+**影响分析**：
+
+| 受影响项 | 具体影响 | 严重程度 |
+|----------|----------|----------|
+| **邮件链接** | 邮件中的链接是 `http://...`，用户点击后可能被浏览器重定向到 https，或者显示安全警告 | 🔴 高 |
+| **API 响应** | API 返回的 `ping_url`、`update_url` 等都是 `http://...` | 🟡 中 |
+| **前端页面** | 页面本身通过 https 访问（因为反向代理处理了 TLS），但页面中的 `{% site_root %}` 输出的是 `http://...` | 🟡 中 |
+| **OAuth 集成** | Slack、Discord 等 OAuth 回调 URL 配置错误，导致集成失败 | 🔴 高 |
+| **静态资源** | 静态资源使用相对路径，不受直接影响 | 🟢 低 |
+
+**实际案例**：
+- 用户收到告警邮件，点击链接 `http://hc.example.com/checks/...`
+- 浏览器显示"不安全"警告，或者被 HSTS 策略强制跳转到 https
+- 用户体验差，甚至可能放弃访问
+
+#### 场景 2: SECURE_PROXY_SSL_HEADER 未配置，但实际使用 HTTPS
+
+**配置示例**：
+```bash
+# 错误：反向代理发送 X-Forwarded-Proto: https，但 Django 不信任它
+SITE_ROOT=https://hc.example.com
+# SECURE_PROXY_SSL_HEADER 未设置！
+```
+
+**影响分析**：
+
+这是一个**更隐蔽**的问题，影响的是 Django 的运行时行为：
+
+| 受影响项 | 具体影响 | 严重程度 |
+|----------|----------|----------|
+| **`request.is_secure()`** | 返回 `False`，Django 认为请求是 HTTP | 🔴 高 |
+| **Session Cookie** | 如果设置了 `SESSION_COOKIE_SECURE=True`，Cookie 的 `Secure` 属性会被设置，但 Django 认为请求是 HTTP，可能导致会话问题 | 🟡 中 |
+| **CSRF 验证** | Django 的 CSRF 保护在某些情况下会检查协议，可能导致 403 错误 | 🔴 高 |
+| **uWSGI 行为** | 根据官方文档，uWSGI 依赖 `X-Forwarded-Proto` 来判断请求安全性，配置错误会导致 CSRF 验证失败 | 🔴 高 |
+| **WebAuthn** | WebAuthn（无密码登录）要求 HTTPS 环境，`request.is_secure()` 返回 `False` 会导致 WebAuthn 无法使用 | 🟡 中 |
+| **SITE_ROOT** | 不受影响，因为是静态配置 | 🟢 无 |
+| **邮件链接** | 不受影响，因为使用 SITE_ROOT | 🟢 无 |
+
+**官方文档引用**（`templates/docs/self_hosted_docker.md`）：
+
+> **Important:** This Dockerfile uses uWSGI, which relies on the [X-Forwarded-Proto](...) header to determine if a request is secure or not. Without this information you may run into **HTTP 403 "CSRF verification failed." errors** when using your Healthchecks instance.
+
+#### 场景 3: 反向代理未正确设置/覆盖 X-Forwarded-Proto
+
+**风险场景**：
+```
+用户 --(HTTP)--> 攻击者 --(伪造 X-Forwarded-Proto: https)--> 反向代理 ---> Django
+```
+
+如果反向代理**信任**用户发送的 `X-Forwarded-Proto` header 而不覆盖它：
+
+| 风险 | 说明 |
+|------|------|
+| **协议欺骗** | 用户可以发送 `X-Forwarded-Proto: https`，让 Django 认为是 HTTPS 请求 |
+| **安全绕过** | 某些安全检查可能被绕过 |
+| **Cookie 泄露** | 如果 Cookie 没有 `Secure` 属性，可能在 HTTP 连接中泄露 |
+
+**正确的反向代理配置应该**：
+1. 丢弃用户发送的 `X-Forwarded-*` header
+2. 根据实际连接情况重新设置这些 header
+
+#### 场景 4: X-Forwarded-For 配置错误
+
+**配置问题**：
+- 反向代理没有设置 `X-Forwarded-For`
+- 或者信任用户发送的 `X-Forwarded-For`
+
+**影响分析**：
+
+| 受影响项 | 具体影响 | 严重程度 |
+|----------|----------|----------|
+| **IP 限流** | 登录表单的 IP 限流可能被绕过，攻击者可以暴力破解密码 | 🔴 高 |
+| **日志记录** | 日志中记录的客户端 IP 不正确，影响安全审计 | 🟡 中 |
+| **速率限制** | API 速率限制可能被绕过 | 🟡 中 |
+
+**官方文档警告**（`templates/docs/self_hosted_docker.md`）：
+
+> **Important:** configure the reverse proxy to set the `X-Forwarded-For` request header. Healthchecks trusts it to determine the client's IP address. If the proxy does not set the `X-Forwarded-For` header, the clients can pass their own value and circumvent, among other things, the **IP-based rate limiting in the login form**.
+
+### 连锁影响总结
+
+#### 直接影响 vs 间接影响
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     配置错误影响链                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  SITE_ROOT=http://... (协议错误)                                │
+│       │                                                        │
+│       ├──► 邮件链接是 http://...                               │
+│       │         │                                              │
+│       │         ├──► 用户点击时浏览器安全警告                   │
+│       │         ├──► HSTS 强制重定向（如果有）                 │
+│       │         └──► 某些邮件客户端可能阻止访问                 │
+│       │                                                        │
+│       ├──► API 响应中的 URL 是 http://...                      │
+│       │         │                                              │
+│       │         └──► 客户端使用 http 调用，可能被重定向或拦截   │
+│       │                                                        │
+│       └──► OAuth 回调 URL 配置错误                             │
+│                 │                                              │
+│                 └──► Slack/Discord 等集成无法使用              │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  SECURE_PROXY_SSL_HEADER 未配置                                │
+│       │                                                        │
+│       ├──► request.is_secure() 返回 False                     │
+│       │         │                                              │
+│       │         ├──► CSRF 验证可能失败 (403 错误)             │
+│       │         ├──► WebAuthn 无法使用                        │
+│       │         └──► 某些安全中间件行为异常                    │
+│       │                                                        │
+│       └──► uWSGI 无法正确判断请求协议                          │
+│                 │                                              │
+│                 └──► 官方文档明确警告会导致 CSRF 问题          │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  X-Forwarded-For 未正确配置                                    │
+│       │                                                        │
+│       ├──► 客户端可以伪造 IP 地址                              │
+│       │         │                                              │
+│       │         ├──► 绕过登录限流，暴力破解密码                │
+│       │         └──► 日志中 IP 不可信，影响安全审计            │
+│       │                                                        │
+│       └──► 如果反向代理信任用户 header                         │
+│                 │                                              │
+│                 └──► 攻击者可以完全控制这些 header 的值        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 受影响功能的详细列表
+
+| 功能模块 | SITE_ROOT 协议错误 | SECURE_PROXY_SSL_HEADER 错误 | X-Forwarded-For 错误 |
+|----------|-------------------|-------------------------------|----------------------|
+| 邮件链接 | 🔴 协议错误 | 🟢 无影响 | 🟢 无影响 |
+| API 响应 URL | 🔴 协议错误 | 🟢 无影响 | 🟢 无影响 |
+| Ping 展示地址 | 🔴 协议错误 | 🟢 无影响 | 🟢 无影响 |
+| OAuth 集成 | 🔴 回调 URL 错误 | 🟢 无影响 | 🟢 无影响 |
+| CSRF 保护 | 🟢 无影响 | 🔴 可能 403 错误 | 🟢 无影响 |
+| Session 管理 | 🟢 无影响 | 🟡 可能异常 | 🟢 无影响 |
+| WebAuthn 登录 | 🟢 无影响 | 🟡 无法使用 | 🟢 无影响 |
+| 登录限流 | 🟢 无影响 | 🟢 无影响 | 🔴 可被绕过 |
+| 安全审计 | 🟢 无影响 | 🟢 无影响 | 🔴 IP 不可信 |
+
+---
+
+## 可落地的排查步骤
+
+### 排查前的准备
+
+在开始排查之前，确认以下信息：
+
+1. **用户访问方式**：用户是通过 http 还是 https 访问？
+2. **反向代理类型**：使用的是 Nginx、HAProxy、Traefik 还是其他？
+3. **部署方式**：Docker、直接运行、还是其他方式？
+4. **症状表现**：具体是什么问题？（邮件链接错误？403 错误？无法登录？）
+
+### 第一阶段：配置静态检查
+
+#### 步骤 1: 检查 SITE_ROOT 配置
+
+**检查项**：
+- `SITE_ROOT` 的协议是否正确？
+- `SITE_ROOT` 的域名是否正确？
+- 如果是子路径部署，路径是否正确？
+
+**验证方法**：
+
+```bash
+# 方法 1: 检查环境变量
+echo $SITE_ROOT
+
+# 方法 2: 通过 Django shell 检查
+python manage.py shell -c "from django.conf import settings; print('SITE_ROOT:', settings.SITE_ROOT)"
+
+# 方法 3: 检查系统检查
+python manage.py check
+```
+
+**预期结果**：
+- 应该以 `https://` 开头（如果是生产环境）
+- 域名应该与用户实际访问的域名一致
+
+**常见错误**：
+```bash
+# 错误：使用 http
+SITE_ROOT=http://hc.example.com
+
+# 错误：端口不对
+SITE_ROOT=https://hc.example.com:8000
+
+# 错误：域名不对
+SITE_ROOT=https://wrong-domain.com
+```
+
+#### 步骤 2: 检查 SECURE_PROXY_SSL_HEADER 配置
+
+**检查项**：
+- 是否配置了 `SECURE_PROXY_SSL_HEADER`？
+- 配置格式是否正确？
+
+**验证方法**：
+
+```bash
+# 检查环境变量
+echo $SECURE_PROXY_SSL_HEADER
+
+# 通过 Django shell 检查
+python manage.py shell -c "
+from django.conf import settings
+print('SECURE_PROXY_SSL_HEADER:', getattr(settings, 'SECURE_PROXY_SSL_HEADER', 'NOT SET'))
+"
+
+# 运行系统检查
+python manage.py check
+```
+
+**预期结果**（生产环境使用反向代理时）：
+```
+SECURE_PROXY_SSL_HEADER: ('HTTP_X_FORWARDED_PROTO', 'https')
+```
+
+**常见错误**：
+```bash
+# 错误：未设置
+SECURE_PROXY_SSL_HEADER= （空或未设置）
+
+# 错误：格式错误（元组格式不对）
+SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO
+```
+
+#### 步骤 3: 检查 ALLOWED_HOSTS 配置
+
+**检查项**：
+- `ALLOWED_HOSTS` 是否包含用户访问的域名？
+
+**验证方法**：
+
+```bash
+# 通过 Django shell 检查
+python manage.py shell -c "
+from django.conf import settings
+print('ALLOWED_HOSTS:', settings.ALLOWED_HOSTS)
+"
+```
+
+**预期结果**：
+- 应该包含用户实际访问的域名
+- 如果 `SITE_ROOT` 配置正确，这通常会自动推导正确
+
+#### 步骤 4: 检查 PING_ENDPOINT 配置（如果使用独立域名）
+
+**检查项**：
+- 如果使用独立的 ping 域名，`PING_ENDPOINT` 是否正确？
+
+**验证方法**：
+
+```bash
+# 通过 Django shell 检查
+python manage.py shell -c "
+from django.conf import settings
+print('SITE_ROOT:', settings.SITE_ROOT)
+print('PING_ENDPOINT:', settings.PING_ENDPOINT)
+"
+```
+
+**预期结果**：
+- 如果不使用独立 ping 域名，`PING_ENDPOINT` 应该是 `SITE_ROOT + '/ping/'`
+- 如果使用独立域名，应该是正确的 `https://ping.example.com/`
+
+### 第二阶段：运行时行为检查
+
+#### 步骤 5: 检查请求协议识别
+
+**目标**：验证 Django 是否正确识别请求是 HTTP 还是 HTTPS
+
+**验证方法**：
+
+创建一个临时测试视图，或者使用 Django shell 模拟请求：
+
+```python
+# 在 Django shell 中运行
+python manage.py shell
+
+# 输入以下内容：
+from django.test import RequestFactory
+from django.conf import settings
+
+factory = RequestFactory()
+
+# 模拟带有 X-Forwarded-Proto header 的请求
+request = factory.get('/', HTTP_X_FORWARDED_PROTO='https')
+
+# 检查 request.is_secure() 的返回值
+print(f"request.is_secure(): {request.is_secure()}")
+print(f"SECURE_PROXY_SSL_HEADER: {getattr(settings, 'SECURE_PROXY_SSL_HEADER', 'NOT SET')}")
+```
+
+**预期结果（HTTPS 环境）**：
+```
+request.is_secure(): True
+```
+
+**异常结果及处理**：
+
+| 结果 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| `request.is_secure()` 返回 `False` | `SECURE_PROXY_SSL_HEADER` 未配置或配置错误 | 正确配置 `SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https` |
+
+#### 步骤 6: 验证反向代理 Header 设置
+
+**目标**：确认反向代理是否正确设置了必要的 header
+
+**验证方法**：
+
+创建一个临时的调试视图来显示请求 header：
+
+```python
+# 在 hc/front/views.py 中临时添加（记得之后删除）
+
+def debug_headers(request):
+    from django.http import JsonResponse
+    headers = {k: v for k, v in request.META.items() if k.startswith('HTTP_')}
+    return JsonResponse({
+        'is_secure': request.is_secure(),
+        'scheme': request.scheme,
+        'headers': headers,
+        'HOST': request.META.get('HTTP_HOST'),
+        'X_FORWARDED_FOR': request.META.get('HTTP_X_FORWARDED_FOR'),
+        'X_FORWARDED_PROTO': request.META.get('HTTP_X_FORWARDED_PROTO'),
+    })
+```
+
+然后通过浏览器或 curl 访问：
+
+```bash
+curl https://hc.example.com/debug-headers/
+```
+
+**预期结果**：
+```json
+{
+  "is_secure": true,
+  "scheme": "https",
+  "X_FORWARDED_FOR": "真实客户端IP",
+  "X_FORWARDED_PROTO": "https",
+  "HOST": "hc.example.com"
+}
+```
+
+**异常结果**：
+
+| 异常 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| `X_FORWARDED_PROTO` 不存在 | 反向代理未设置此 header | 在反向代理配置中添加 `proxy_set_header X-Forwarded-Proto $scheme;` |
+| `X_FORWARDED_PROTO` 是 `http` | 反向代理配置错误，或者用户通过 http 访问 | 检查反向代理配置，确认用户是否通过 https 访问 |
+| `is_secure` 是 `false` 但 `X_FORWARDED_PROTO` 是 `https` | `SECURE_PROXY_SSL_HEADER` 未配置 | 配置 `SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https` |
+
+#### 步骤 7: 检查邮件链接
+
+**目标**：验证邮件中的链接是否正确
+
+**验证方法**：
+
+1. **触发一封测试邮件**（如登录链接、告警邮件）
+2. **检查邮件内容**中的链接
+
+或者通过 Django shell 直接测试 URL 生成：
+
+```bash
+python manage.py shell -c "
+from django.conf import settings
+from hc.lib.urls import absolute_reverse, absolute_url
+
+print('=== 配置检查 ===')
+print(f'SITE_ROOT: {settings.SITE_ROOT}')
+print(f'PING_ENDPOINT: {settings.PING_ENDPOINT}')
+
+print()
+print('=== URL 生成测试 ===')
+print(f'absolute_url(\"/accounts/login/\"): {absolute_url(\"/accounts/login/\")}')
+print(f'absolute_reverse(\"hc-login\"): {absolute_reverse(\"hc-login\")}')
+
+print()
+print('=== 协议检查 ===')
+print(f'SITE_ROOT 使用的协议: {\"https\" if \"https://\" in settings.SITE_ROOT else \"http\"}')
+"
+```
+
+**预期结果**：
+- 所有生成的 URL 都应该使用正确的协议（https）
+- 域名应该正确
+
+**异常处理**：
+
+如果 `SITE_ROOT=http://...` 但需要使用 https：
+
+```bash
+# 修正配置
+SITE_ROOT=https://hc.example.com
+```
+
+#### 步骤 8: 检查 CSRF 和登录功能
+
+**目标**：验证登录表单是否正常工作，CSRF 验证是否通过
+
+**验证方法**：
+
+1. **尝试登录**：
+   - 打开登录页面
+   - 输入用户名密码（或创建测试用户）
+   - 点击登录
+
+2. **观察结果**：
+   - 成功登录？
+   - 还是出现 403 Forbidden 错误？
+   - 还是其他错误？
+
+**常见问题及解决**：
+
+| 症状 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| 403 CSRF verification failed | `SECURE_PROXY_SSL_HEADER` 未配置或 `X-Forwarded-Proto` 错误 | 检查反向代理 header 和 Django 配置 |
+| 登录成功但会话丢失 | Cookie 的 `Secure` 属性问题 | 检查 `SESSION_COOKIE_SECURE` 配置 |
+| 页面可以访问但表单提交失败 | `Host` header 问题 | 检查反向代理是否正确传递 `Host` header |
+
+### 第三阶段：反向代理配置验证
+
+#### 步骤 9: 检查 Nginx 配置（如果使用 Nginx）
+
+**关键配置项检查**：
+
+```nginx
+# 必须配置项检查：
+
+# 1. 检查是否设置了 X-Forwarded-Proto
+grep -r "X-Forwarded-Proto" /etc/nginx/
+
+# 2. 检查是否设置了 Host header
+grep -r "proxy_set_header Host" /etc/nginx/
+
+# 3. 检查是否设置了 X-Forwarded-For
+grep -r "X-Forwarded-For" /etc/nginx/
+```
+
+**推荐的 Nginx 配置**：
+
+```nginx
+location / {
+    proxy_pass http://localhost:8000;
+    
+    # 关键：传递原始协议
+    proxy_set_header X-Forwarded-Proto $scheme;
+    
+    # 关键：传递原始 Host
+    proxy_set_header Host $host;
+    
+    # 传递客户端真实 IP
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    
+    # 其他建议配置
+    proxy_redirect off;
+    proxy_http_version 1.1;
+}
+```
+
+**常见错误**：
+
+```nginx
+# 错误：使用 $http_host 而不是 $host
+proxy_set_header Host $http_host;  # 不推荐
+
+# 错误：未设置 X-Forwarded-Proto
+# （缺少这一行）
+
+# 错误：直接传递用户的 X-Forwarded-Proto
+# （应该使用 $scheme 而不是 $http_x_forwarded_proto）
+```
+
+#### 步骤 10: 检查其他反向代理
+
+**HAProxy** 关键配置：
+
+```haproxy
+# 必须配置：根据 SSL 终止情况设置 X-Forwarded-Proto
+http-request set-header X-Forwarded-Proto https if { ssl_fc }
+http-request set-header X-Forwarded-Proto http unless { ssl_fc }
+```
+
+**Traefik** 关键配置：
+
+Traefik 通常会自动设置这些 header，但需要确认：
+
+```yaml
+# 在动态配置或 Docker labels 中
+traefik.http.middlewares.sslheader.headers.customRequestHeaders.X-Forwarded-Proto=https
+```
+
+### 第四阶段：综合验证
+
+#### 步骤 11: 端到端测试
+
+执行以下完整测试流程：
+
+1. **访问首页**：
+   ```bash
+   curl -I https://hc.example.com/
+   ```
+   - 检查返回状态码（应该是 200 或 302 到登录页）
+   - 检查 `Location` header（如果有重定向）是否使用正确的协议
+
+2. **访问登录页**：
+   - 用浏览器打开 `https://hc.example.com/accounts/login/`
+   - 检查页面源代码中的表单 action
+   - 应该是正确的 https URL
+
+3. **测试登录**：
+   - 尝试登录
+   - 确认没有 403 错误
+   - 确认登录后会话保持
+
+4. **触发测试邮件**：
+   - 使用"忘记密码"或其他会发送邮件的功能
+   - 检查收到的邮件中的链接
+   - 确认链接使用 https 协议
+
+5. **测试 API**：
+   ```bash
+   curl -H "X-Api-Key: your-api-key" https://hc.example.com/api/v2/checks/
+   ```
+   - 检查响应中的 `ping_url`、`update_url` 等字段
+   - 确认使用正确的协议
+
+#### 步骤 12: 运行系统检查
+
+```bash
+# 运行 Django 的系统检查
+python manage.py check
+
+# 运行数据库迁移检查
+python manage.py migrate --check
+
+# 如果有自定义的健康检查
+python manage.py check --deploy
+```
+
+### 快速排查 Checklist
+
+| # | 检查项 | 命令/方法 | 预期结果 |
+|---|--------|-----------|----------|
+| 1 | `SITE_ROOT` 协议 | `echo $SITE_ROOT` | 以 `https://` 开头 |
+| 2 | `SITE_ROOT` 域名 | 与用户访问域名对比 | 一致 |
+| 3 | `SECURE_PROXY_SSL_HEADER` | `python manage.py shell -c "from django.conf import settings; print(getattr(settings, 'SECURE_PROXY_SSL_HEADER', 'NOT SET'))"` | `('HTTP_X_FORWARDED_PROTO', 'https')` |
+| 4 | `ALLOWED_HOSTS` | `python manage.py shell -c "from django.conf import settings; print(settings.ALLOWED_HOSTS)"` | 包含访问域名 |
+| 5 | 反向代理 `X-Forwarded-Proto` | 调试视图或日志 | `https` |
+| 6 | 反向代理 `Host` | 调试视图或日志 | 正确的域名 |
+| 7 | `request.is_secure()` | Django shell 测试 | `True` |
+| 8 | 邮件链接协议 | 检查测试邮件 | `https://` |
+| 9 | API 响应 URL 协议 | 调用 API 检查 | `https://` |
+| 10 | 登录功能 | 实际登录测试 | 成功，无 403 错误 |
+
+### 常见问题解决方案速查
+
+#### 问题 1: 邮件中的链接是 http 而不是 https
+
+**解决方案**：
+```bash
+# 设置正确的 SITE_ROOT
+SITE_ROOT=https://hc.example.com
+```
+
+**注意**：这与 `SECURE_PROXY_SSL_HEADER` 无关！邮件链接直接使用 `SITE_ROOT` 配置值。
+
+#### 问题 2: 登录表单返回 403 CSRF 错误
+
+**解决方案**：
+
+步骤 1: 配置 Django 信任反向代理 header
+```bash
+SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
+```
+
+步骤 2: 确认反向代理正确设置 header
+
+**Nginx**:
+```nginx
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Host $host;
+```
+
+#### 问题 3: 可以访问页面但所有 POST 请求都失败
+
+**可能原因**：`Host` header 不正确
+
+**解决方案**：
+
+在反向代理中正确传递 `Host` header：
+
+**Nginx**:
+```nginx
+proxy_set_header Host $host;
+# 不是 $http_host！
+```
+
+同时确认 `ALLOWED_HOSTS` 配置正确。
+
+#### 问题 4: 登录成功后立即被登出
+
+**可能原因**：Session Cookie 的 `Secure` 属性问题
+
+**检查**：
+```bash
+# 检查 SESSION_COOKIE_SECURE 配置
+python manage.py shell -c "
+from django.conf import settings
+print('SESSION_COOKIE_SECURE:', getattr(settings, 'SESSION_COOKIE_SECURE', 'DEFAULT'))
+"
+```
+
+**解决方案**：
+- 如果通过 https 访问，确保 `request.is_secure()` 返回 `True`
+- 或者显式设置：`SESSION_COOKIE_SECURE=True`（如果始终使用 https）
+
+#### 问题 5: WebAuthn（无密码登录）无法使用
+
+**可能原因**：`request.is_secure()` 返回 `False`
+
+WebAuthn 规范要求在安全上下文中使用（HTTPS 或 localhost）。
+
+**解决方案**：
+- 正确配置 `SECURE_PROXY_SSL_HEADER`
+- 确认 `X-Forwarded-Proto` 正确传递
+
+---
+
 ## 配置依赖关系图
 
 ```
-                    ┌─────────────────┐
-                    │   SITE_ROOT     │
-                    │ (环境变量)       │
-                    └────────┬────────┘
-                             │
-            ┌────────────────┼────────────────┐
-            │                │                │
-            ▼                ▼                ▼
-    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-    │ ALLOWED_HOSTS│ │  LOGIN_URL   │ │  STATIC_URL  │
-    │ (自动推导)    │ │ (path 派生)   │ │ (path 派生)   │
-    └──────────────┘ └──────────────┘ └──────────────┘
-            │                │                │
-            ▼                ▼                ▼
-    ┌─────────────────────────────────────────────────┐
-    │              PING_ENDPOINT (默认值)              │
-    │         SITE_ROOT + "/ping/"                     │
-    └─────────────────────────┬───────────────────────┘
-                              │
-                              ▼
-    ┌─────────────────────────────────────────────────┐
-    │              URL 路由前缀 (prefix)               │
-    │  当 SITE_ROOT 包含路径时，所有 URL 自动添加此前缀  │
-    └─────────────────────────┬───────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-    │ absolute_url │ │absolute_rever│ │  模板标签     │
-    │   函数       │ │    se 函数    │ │ {% site_root %}│
-    └──────────────┘ └──────────────┘ └──────────────┘
-              │               │               │
-              ▼               ▼               ▼
-    ┌─────────────────────────────────────────────────┐
-    │              生成的绝对 URL 应用场景              │
-    │  - 邮件中的链接                                   │
-    │  - API 响应中的 URL                               │
-    │  - OAuth 回调 URL                                 │
-    │  - Webhook 配置 URL                               │
-    └─────────────────────────────────────────────────┘
+                    ┌─────────────────────────────────┐
+                    │      外部请求 (用户浏览器)        │
+                    │    https://hc.example.com        │
+                    └───────────────┬─────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────────┐
+                    │      反向代理 (Nginx/HAProxy)    │
+                    │  TLS 终止，设置 header:         │
+                    │  X-Forwarded-Proto: https      │
+                    │  X-Forwarded-For: 真实IP        │
+                    │  Host: hc.example.com           │
+                    └───────────────┬─────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────────┐
+                    │      Django (uWSGI/Gunicorn)    │
+                    │                                 │
+                    │  读取配置:                        │
+                    │  ├── SITE_ROOT (静态)            │
+                    │  ├── PING_ENDPOINT (静态)        │
+                    │  └── SECURE_PROXY_SSL_HEADER     │
+                    │                                 │
+                    │  运行时判断:                      │
+                    │  ├── request.is_secure()?        │
+                    │  ├── request.scheme?              │
+                    │  └── CSRF 验证?                   │
+                    └───────────────┬─────────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            │                       │                       │
+            ▼                       ▼                       ▼
+    ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+    │  静态 URL 生成  │    │  运行时行为    │    │  安全功能     │
+    │               │    │               │    │               │
+    │  使用配置值:   │    │  依赖 header:  │    │  依赖 header: │
+    │  SITE_ROOT    │    │  X-Forwarded-* │    │  X-Forwarded-* │
+    │  PING_ENDPOINT│    │               │    │               │
+    │               │    │  - request.is_ │    │  - CSRF 验证  │
+    │  影响:         │    │    secure()   │    │  - Session    │
+    │  - 邮件链接    │    │  - 相对 URL   │    │  - WebAuthn   │
+    │  - API 响应    │    │    协议继承    │    │  - IP 限流    │
+    │  - OAuth 回调  │    │  - 重定向 URL  │    │               │
+    │  - 页面展示    │    │               │    │               │
+    └───────────────┘    └───────────────┘    └───────────────┘
 ```
+
+### 配置与影响关系表
+
+| 配置项 | 影响静态 URL 生成 | 影响运行时行为 | 影响安全功能 |
+|--------|------------------|----------------|--------------|
+| `SITE_ROOT` | ✅ 直接决定 | ❌ 无影响 | ❌ 无影响 |
+| `PING_ENDPOINT` | ✅ 直接决定 | ❌ 无影响 | ❌ 无影响 |
+| `SECURE_PROXY_SSL_HEADER` | ❌ 无影响 | ✅ 直接决定 | ✅ 直接决定 |
+| 反向代理 `X-Forwarded-Proto` | ❌ 无影响 | ✅ 直接决定 | ✅ 直接决定 |
+| 反向代理 `X-Forwarded-For` | ❌ 无影响 | ❌ 无影响 | ✅ 直接决定 |
+| 反向代理 `Host` | ❌ 无影响 | ✅ 影响重定向 | ✅ 影响 CSRF |
 
 ---
 
@@ -643,32 +1379,46 @@ def debug_warning() -> str:
 ### 生产环境必须配置
 
 ```bash
-# 基础配置
+# ==================== 基础配置 ====================
+# 关键：必须使用 https 协议！
 SITE_ROOT=https://your-domain.com
 SITE_NAME=Your Monitoring
-SECRET_KEY=your-secure-secret-key
+
+# 安全配置
+SECRET_KEY=your-secure-secret-key-at-least-50-chars-long
 DEBUG=False
 
-# 数据库配置
+# 注册控制（生产环境建议关闭公开注册）
+REGISTRATION_OPEN=False
+
+# ==================== 数据库配置 ====================
 DB=postgres
 DB_HOST=db
 DB_NAME=hc
 DB_USER=postgres
 DB_PASSWORD=your-db-password
 
-# 邮件配置
+# ==================== 邮件配置 ====================
 EMAIL_HOST=smtp.example.com
 EMAIL_PORT=587
 EMAIL_HOST_USER=noreply@example.com
 EMAIL_HOST_PASSWORD=your-smtp-password
 DEFAULT_FROM_EMAIL=noreply@example.com
+EMAIL_USE_TLS=True
 
-# 反向代理与 HTTPS
+# ==================== 反向代理与 HTTPS ====================
+# 关键：告诉 Django 信任 X-Forwarded-Proto header
 SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
+
+# 允许的主机名（通常自动从 SITE_ROOT 推导）
 ALLOWED_HOSTS=your-domain.com
 
-# 注册控制
-REGISTRATION_OPEN=False  # 生产环境建议关闭公开注册
+# ==================== 可选：其他功能 ====================
+# WebAuthn（无密码登录）- 需要与 SITE_ROOT 域名一致
+RP_ID=your-domain.com
+
+# 如果使用独立的 ping 域名
+# PING_ENDPOINT=https://ping.your-domain.com/
 ```
 
 ### 子路径部署
@@ -678,12 +1428,67 @@ SITE_ROOT=https://your-domain.com/monitoring
 # 其他配置同上...
 ```
 
+系统会自动：
+- `STATIC_URL=/monitoring/static/`
+- `LOGIN_URL=/monitoring/accounts/login/`
+- 所有 URL 路由添加 `/monitoring/` 前缀
+
 ### 独立 Ping 域名
 
 ```bash
 SITE_ROOT=https://hc.example.com
 PING_ENDPOINT=https://ping.example.com/
 # 需要在反向代理中配置 ping.example.com 的路由
+```
+
+### Nginx 配置模板
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name hc.example.com;
+
+    # SSL 配置
+    ssl_certificate /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        
+        # 关键：协议传递
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # 关键：Host 传递
+        proxy_set_header Host $host;
+        
+        # 客户端 IP 传递
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        
+        # 其他优化
+        proxy_redirect off;
+        proxy_http_version 1.1;
+        
+        # 超时设置
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # 静态文件（如果不使用 WhiteNoise）
+    # location /static/ {
+    #     alias /path/to/static-collected/;
+    #     expires 30d;
+    #     add_header Cache-Control "public, immutable";
+    # }
+}
+
+# HTTP 到 HTTPS 重定向
+server {
+    listen 80;
+    server_name hc.example.com;
+    return 301 https://$server_name$request_uri;
+}
 ```
 
 ---
@@ -699,3 +1504,5 @@ PING_ENDPOINT=https://ping.example.com/
 | `hc/api/apps.py` | 系统检查与配置验证 |
 | `hc/front/templatetags/hc_extras.py` | 模板标签与辅助函数 |
 | `hc/urls.py` | URL 路由配置 |
+| `templates/docs/self_hosted_docker.md` | 官方 Docker 部署文档 |
+| `templates/docs/self_hosted_configuration.md` | 官方配置文档 |
