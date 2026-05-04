@@ -33,59 +33,186 @@ body = request.body[: settings.PING_BODY_LIMIT]          # 请求 Body（有大�
 
 ## 1.3 Header 各字段用途分析
 
+### 核心概念区分
+
+在分析 Header 字段时，需要明确区分两个独立的概念：
+
+1. **是否被读取**：字段值是否被代码读取并存入变量
+2. **是否参与成功/失败判定**：字段值是否影响最终的 `action`（success/fail/ign/start）
+
+---
+
+### 被读取的 Header 字段汇总
+
 系统从 `request.META`（Django 封装的 HTTP 请求头字典）中读取以下字段：
 
-| Header 字段 | 变量名 | 用途 | 参与成功/失败判定 | 代码位置 |
-|-------------|--------|------|------------------|----------|
-| `HTTP_X_FORWARDED_FOR` 或 `REMOTE_ADDR` | `remote_addr` | 记录客户端 IP 地址 | ❌ 否 | `hc/api/views.py:197-205` |
-| `HTTP_X_FORWARDED_PROTO` | `scheme` | 记录请求协议（http/https） | ❌ 否 | `hc/api/views.py:207` |
-| `REQUEST_METHOD` | `method` | HTTP 请求方法（GET/POST 等） | ✅ 是 | `hc/api/views.py:208, 215-216` |
-| `HTTP_USER_AGENT` | `ua` | 记录客户端 User-Agent | ❌ 否 | `hc/api/views.py:209` |
+| Header 字段（Django 格式） | 原始 HTTP 头 | 变量名 | 是否被读取 | 参与成功/失败判定 | 代码位置 |
+|----------------------------|-------------|--------|-----------|------------------|----------|
+| `HTTP_X_FORWARDED_FOR` 或 `REMOTE_ADDR` | `X-Forwarded-For` 或连接层信息 | `remote_addr` | ✅ 是 | ❌ 否 | `hc/api/views.py:197-205` |
+| `HTTP_X_FORWARDED_PROTO` | `X-Forwarded-Proto` | `scheme` | ✅ 是 | ❌ 否 | `hc/api/views.py:207` |
+| `REQUEST_METHOD` | （Django 内置，非 HTTP 头） | `method` | ✅ 是 | ✅ 是 | `hc/api/views.py:208, 215-216` |
+| `HTTP_USER_AGENT` | `User-Agent` | `ua` | ✅ 是 | ❌ 否 | `hc/api/views.py:209` |
+
+**关于 `REQUEST_METHOD` 的说明**：
+- `REQUEST_METHOD` 是 Django `request.META` 中的内置键，表示 HTTP 请求方法
+- 它**不是**一个 HTTP 请求头，而是由 Web 服务器/Django 框架提供的请求元信息
+- 但它是**唯一参与成功/失败判定**的请求元信息字段
+
+---
 
 ### 各字段详细说明
 
 #### 1. `remote_addr`（客户端 IP）
-- **来源**：优先读取 `HTTP_X_FORWARDED_FOR`（代理转发的真实 IP），否则读取 `REMOTE_ADDR`
-- **处理逻辑**：
-  - 从 `X-Forwarded-For` 中取第一个 IP（多个代理时用逗号分隔）
-  - 对 Azure App Service 等环境的 `ip:port` 格式进行特殊处理，提取纯 IP
-- **存储位置**：`Ping.remote_addr`（`GenericIPAddressField`）
-- **判定参与**：**不参与**，仅用于日志记录和审计
+
+**读取的 Header**：
+- 优先：`X-Forwarded-For`（当请求经过反向代理时，代理会添加此头）
+- 备选：`REMOTE_ADDR`（直接连接的客户端 IP）
+
+**代码逻辑**（`hc/api/views.py:197-205`）：
+```python
+remote_addr = headers.get("HTTP_X_FORWARDED_FOR", headers["REMOTE_ADDR"])
+remote_addr = remote_addr.split(",")[0]  # 取第一个 IP
+
+# 处理 Azure App Service 的 ip:port 格式
+if not valid_ip(remote_addr):
+    parts = remote_addr.split(".")
+    if len(parts) == 4 and ":" in parts[-1]:
+        remote_addr = remote_addr.split(":")[0]
+```
+
+**用途**：
+- 记录发起 ping 请求的客户端 IP 地址
+- 存入 `Ping.remote_addr` 字段
+
+**参与判定**：**不参与**，仅用于日志记录和审计
+
+---
 
 #### 2. `scheme`（协议）
-- **来源**：`HTTP_X_FORWARDED_PROTO` 头，默认为 `"http"`
-- **用途**：记录请求是通过 HTTP 还是 HTTPS 发送
-- **存储位置**：`Ping.scheme`（`CharField(10)`）
-- **判定参与**：**不参与**，仅用于记录
 
-#### 3. `method`（HTTP 方法）
-- **来源**：`REQUEST_METHOD`
-- **用途**：
-  1. 参与成功/失败判定（当 `check.methods == "POST"` 时）
-  2. 记录到 Ping 日志
-- **判定逻辑**（`hc/api/views.py:215-216`）：
-  ```python
-  if check.methods == "POST" and method != "POST":
-      action = "ign"
-  ```
-  - 当 `check.methods` 设置为 `"POST"` 时，只有 POST 请求会被正常处理
-  - 非 POST 请求会被标记为 `"ign"`（忽略）
-- **存储位置**：`Ping.method`（`CharField(10)`）
-- **判定参与**：**参与**，是唯一参与成功/失败判定的 Header 字段
+**读取的 Header**：
+- `X-Forwarded-Proto`（反向代理添加，标识原始请求协议）
+- 默认值：`"http"`
+
+**代码逻辑**（`hc/api/views.py:207`）：
+```python
+scheme = headers.get("HTTP_X_FORWARDED_PROTO", "http")
+```
+
+**用途**：
+- 记录请求是通过 HTTP 还是 HTTPS 发送
+- 存入 `Ping.scheme` 字段
+
+**参与判定**：**不参与**，仅用于记录
+
+---
+
+#### 3. `method`（HTTP 请求方法）
+
+**来源**：
+- `REQUEST_METHOD`（Django `request.META` 内置键，**不是** HTTP 头）
+- 可能的值：`"GET"`、`"POST"`、`"PUT"`、`"DELETE"` 等
+
+**代码逻辑**（`hc/api/views.py:208, 215-216`）：
+```python
+method = headers["REQUEST_METHOD"]
+
+# 参与成功/失败判定的逻辑
+if check.methods == "POST" and method != "POST":
+    action = "ign"
+```
+
+**判定规则**：
+- 当 `check.methods` 设置为 `"POST"` 时：
+  - `POST` 请求 → 正常处理，不改变 action
+  - 非 `POST` 请求 → `action = "ign"`（忽略）
+- 当 `check.methods` 为空字符串时：
+  - 所有方法都接受，不影响 action
+
+**用途**：
+1. **参与成功/失败判定**（当 `check.methods == "POST"` 时）
+2. 记录到 `Ping.method` 字段
+
+**参与判定**：**参与**，是**唯一**影响成功/失败判定的请求元信息
+
+---
 
 #### 4. `ua`（User-Agent）
-- **来源**：`HTTP_USER_AGENT` 头，默认为空字符串
-- **处理**：存储时截断到 200 字符（`hc/api/models.py:535`）
-- **存储位置**：`Ping.ua`（`CharField(200)`）
-- **判定参与**：**不参与**，仅用于日志记录
 
-### 未被使用的 Header 字段
+**读取的 Header**：
+- `User-Agent`（客户端标识）
+- 默认值：空字符串 `""`
 
-**重要**：以下 Header 字段**没有被读取**，也**不参与**任何成功/失败判定：
-- `Content-Type`：不用于解析 Body 编码
-- `Authorization`：不用于认证（认证通过 URL 中的 `code` 或 `ping_key` 实现）
-- `Accept`、`Accept-Encoding`、`Accept-Language` 等
-- 所有自定义 `X-*` 头
+**代码逻辑**（`hc/api/views.py:209`）：
+```python
+ua = headers.get("HTTP_USER_AGENT", "")
+```
+
+**处理**：
+- 存储时截断到 200 字符（`hc/api/models.py:535`）：
+  ```python
+  ping.ua = ua[:200]
+  ```
+
+**用途**：
+- 记录客户端的 User-Agent（如 curl、Python requests、浏览器等）
+- 存入 `Ping.ua` 字段
+
+**参与判定**：**不参与**，仅用于日志记录
+
+---
+
+### 转发头（`X-Forwarded-*`）的特殊说明
+
+**被读取但不参与判定**：
+- `X-Forwarded-For` 和 `X-Forwarded-Proto` 确实被代码读取
+- 但它们**只用于记录目的**，**不影响**成功/失败判定
+
+**为什么需要这些转发头**：
+- 当 Healthchecks 部署在反向代理（如 Nginx、Traefik、Cloudflare）后面时：
+  - 直接的 `REMOTE_ADDR` 是代理服务器的 IP，不是真实客户端 IP
+  - `X-Forwarded-For` 包含了真实客户端 IP（由代理添加）
+  - `X-Forwarded-Proto` 标识客户端是通过 HTTP 还是 HTTPS 连接到代理
+
+**设计意图**：
+- 这些字段仅用于**审计和日志**，让用户能够查看 ping 请求来自哪里、通过什么协议发送
+- 它们**不用于**任何业务逻辑判定，确保判定逻辑的简洁和可预测性
+
+---
+
+### 完全未被读取的 Header 字段
+
+以下 Header 字段**既没有被读取**，也**不参与**任何成功/失败判定：
+
+| Header 字段 | 说明 |
+|-------------|------|
+| `Content-Type` | 不用于解析 Body 编码（Body 始终按 UTF-8 尝试解码） |
+| `Authorization` | 不用于认证（认证通过 URL 中的 `code` 或 `ping_key` 实现） |
+| `Accept`、`Accept-Encoding`、`Accept-Language` | 内容协商相关头，完全忽略 |
+| `Cookie` | 不使用 Cookie 进行会话管理 |
+| 其他自定义 `X-*` 头 | 除 `X-Forwarded-For` 和 `X-Forwarded-Proto` 外，所有其他自定义头都被忽略 |
+
+**注意**：
+- `X-Forwarded-For` 和 `X-Forwarded-Proto` 是**例外**，它们被读取但不参与判定
+- 除此之外的所有 `X-*` 自定义头（如 `X-Custom-Header`、`X-Request-ID` 等）都**完全被忽略**
+
+---
+
+### 结论总结
+
+1. **唯一参与成功/失败判定的请求元信息**：
+   - `REQUEST_METHOD`（HTTP 请求方法）
+   - 当 `check.methods == "POST"` 时，非 POST 请求被忽略
+
+2. **被读取但不参与判定的 Header**：
+   - `X-Forwarded-For` → 记录客户端 IP
+   - `X-Forwarded-Proto` → 记录协议
+   - `User-Agent` → 记录客户端标识
+
+3. **完全被忽略的 Header**：
+   - 除上述字段外的所有其他 Header
+   - 包括 `Content-Type`、`Authorization`、`Cookie` 等
+   - 除 `X-Forwarded-For` 和 `X-Forwarded-Proto` 外的所有自定义 `X-*` 头
 
 ---
 
