@@ -31,6 +31,193 @@ body = request.body[: settings.PING_BODY_LIMIT]          # 请求 Body（有大�
 
 ---
 
+## 1.3 Header 各字段用途分析
+
+系统从 `request.META`（Django 封装的 HTTP 请求头字典）中读取以下字段：
+
+| Header 字段 | 变量名 | 用途 | 参与成功/失败判定 | 代码位置 |
+|-------------|--------|------|------------------|----------|
+| `HTTP_X_FORWARDED_FOR` 或 `REMOTE_ADDR` | `remote_addr` | 记录客户端 IP 地址 | ❌ 否 | `hc/api/views.py:197-205` |
+| `HTTP_X_FORWARDED_PROTO` | `scheme` | 记录请求协议（http/https） | ❌ 否 | `hc/api/views.py:207` |
+| `REQUEST_METHOD` | `method` | HTTP 请求方法（GET/POST 等） | ✅ 是 | `hc/api/views.py:208, 215-216` |
+| `HTTP_USER_AGENT` | `ua` | 记录客户端 User-Agent | ❌ 否 | `hc/api/views.py:209` |
+
+### 各字段详细说明
+
+#### 1. `remote_addr`（客户端 IP）
+- **来源**：优先读取 `HTTP_X_FORWARDED_FOR`（代理转发的真实 IP），否则读取 `REMOTE_ADDR`
+- **处理逻辑**：
+  - 从 `X-Forwarded-For` 中取第一个 IP（多个代理时用逗号分隔）
+  - 对 Azure App Service 等环境的 `ip:port` 格式进行特殊处理，提取纯 IP
+- **存储位置**：`Ping.remote_addr`（`GenericIPAddressField`）
+- **判定参与**：**不参与**，仅用于日志记录和审计
+
+#### 2. `scheme`（协议）
+- **来源**：`HTTP_X_FORWARDED_PROTO` 头，默认为 `"http"`
+- **用途**：记录请求是通过 HTTP 还是 HTTPS 发送
+- **存储位置**：`Ping.scheme`（`CharField(10)`）
+- **判定参与**：**不参与**，仅用于记录
+
+#### 3. `method`（HTTP 方法）
+- **来源**：`REQUEST_METHOD`
+- **用途**：
+  1. 参与成功/失败判定（当 `check.methods == "POST"` 时）
+  2. 记录到 Ping 日志
+- **判定逻辑**（`hc/api/views.py:215-216`）：
+  ```python
+  if check.methods == "POST" and method != "POST":
+      action = "ign"
+  ```
+  - 当 `check.methods` 设置为 `"POST"` 时，只有 POST 请求会被正常处理
+  - 非 POST 请求会被标记为 `"ign"`（忽略）
+- **存储位置**：`Ping.method`（`CharField(10)`）
+- **判定参与**：**参与**，是唯一参与成功/失败判定的 Header 字段
+
+#### 4. `ua`（User-Agent）
+- **来源**：`HTTP_USER_AGENT` 头，默认为空字符串
+- **处理**：存储时截断到 200 字符（`hc/api/models.py:535`）
+- **存储位置**：`Ping.ua`（`CharField(200)`）
+- **判定参与**：**不参与**，仅用于日志记录
+
+### 未被使用的 Header 字段
+
+**重要**：以下 Header 字段**没有被读取**，也**不参与**任何成功/失败判定：
+- `Content-Type`：不用于解析 Body 编码
+- `Authorization`：不用于认证（认证通过 URL 中的 `code` 或 `ping_key` 实现）
+- `Accept`、`Accept-Encoding`、`Accept-Language` 等
+- 所有自定义 `X-*` 头
+
+---
+
+## 1.4 Body 非 UTF-8 文本的处理行为
+
+### 两种场景分析
+
+系统对 Body 编码的处理取决于 `filter_http_body` 配置：
+
+#### 场景 1：`filter_http_body = False`（默认配置）
+
+**代码流程**：
+- `hc/api/views.py:218` 的条件 `if action != "ign" and check.filter_http_body:` 为 `False`
+- **不会执行** `body.decode()`
+- Body 直接以原始字节形式传递给 `check.ping()`
+
+**存储方式**（`hc/api/models.py:536-539`）：
+```python
+if len(body) > 100 and settings.S3_BUCKET:
+    ping.object_size = len(body)  # 超过 100 字节且配置了 S3，存储到 S3
+else:
+    ping.body_raw = body  # 否则存储到数据库 BinaryField
+```
+
+**测试验证**（`hc/api/tests/test_ping.py:380-388`）：
+```python
+def test_it_accepts_bad_unicode(self) -> None:
+    # 发送包含无效 UTF-8 字节的 Body
+    # \xe9 是 ISO-8859-1 编码的 "é"，不是有效的 UTF-8
+    r = self.client.post(self.url, b"Hello \xe9 World", content_type="text/plain")
+    self.assertEqual(r.status_code, 200)  # 返回 200 OK
+
+    ping = Ping.objects.get()
+    assert ping.body_raw
+    # Body 以原始字节形式存储
+    self.assertEqual(bytes(ping.body_raw), b"Hello \xe9 World")
+```
+
+**特殊处理**（`hc/api/models.py:521-522`）：
+```python
+# 检查 Body 是否包含 "confirm" 关键词（用于确认链接检测）
+body_lowercase = body.decode(errors="replace").lower()
+self.has_confirmation_link = "confirm" in body_lowercase
+```
+- 这里使用 `errors="replace"`，将无效 UTF-8 字节替换为 `�`（Unicode 替换字符）
+- 这是一个安全的解码方式，不会抛出异常
+
+**结果总结**（`filter_http_body = False`）：
+
+| 项目 | 结果 |
+|------|------|
+| HTTP 响应状态 | **200 OK** |
+| Ping 记录 | ✅ 正常创建 |
+| Body 存储 | 原始字节（`ping.body_raw` 或 S3） |
+| Action 判定 | 按 URL 路径或默认（`"success"`） |
+
+---
+
+#### 场景 2：`filter_http_body = True`（启用 Body 关键词过滤）
+
+**代码流程**（`hc/api/views.py:218-219`）：
+```python
+if action != "ign" and check.filter_http_body:
+    body_text = body.decode()  # ⚠️ 没有指定 errors 参数！
+```
+
+**关键问题**：
+- Python 的 `bytes.decode()` 方法默认行为：
+  - 默认编码：`'utf-8'`
+  - 默认错误处理：`'strict'` → 遇到无效字节时抛出 `UnicodeDecodeError`
+
+**异常触发条件**：
+当以下条件同时满足时：
+1. `filter_http_body = True`
+2. HTTP 请求方法不是 GET（或 `check.methods` 未限制为 POST）
+3. Body 包含无效的 UTF-8 字节（如 ISO-8859-1 编码的 `\xe9`、二进制数据等）
+
+**异常传播**：
+```
+UnicodeDecodeError 抛出
+    ↓
+Django 未捕获的异常
+    ↓
+HTTP 500 Internal Server Error
+    ↓
+❌ check.ping() 未被调用
+    ↓
+❌ Ping 记录未创建
+```
+
+**结果总结**（`filter_http_body = True`）：
+
+| 项目 | 结果 |
+|------|------|
+| HTTP 响应状态 | **500 Internal Server Error** |
+| Ping 记录 | ❌ 未创建 |
+| 异常类型 | `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xe9 in position 6: invalid continuation byte` |
+
+---
+
+### Body 处理行为对比表
+
+| 场景 | `filter_http_body` | Body 编码 | HTTP 状态 | Ping 记录 | Action |
+|------|--------------------|-----------|-----------|-----------|--------|
+| 简单打点（默认） | `False` | UTF-8 | 200 | ✅ | 按 URL 路径 |
+| 简单打点（默认） | `False` | 非 UTF-8 | 200 | ✅ | 按 URL 路径 |
+| 关键词过滤 | `True` | UTF-8 | 200 | ✅ | 按关键词匹配 |
+| 关键词过滤 | `True` | 非 UTF-8 | **500** | ❌ | 无（异常） |
+
+---
+
+### 注意事项
+
+1. **关键词过滤需要 UTF-8 Body**：
+   - 当 `filter_http_body = True` 时，确保发送方使用 UTF-8 编码
+   - 常见非 UTF-8 编码：GBK、GB2312、ISO-8859-1、Shift-JIS 等
+
+2. **二进制数据的处理**：
+   - 如果需要发送二进制数据（如图片、压缩包等），建议：
+     - 不启用 `filter_http_body`（使用默认配置）
+     - 或先进行 Base64 编码（确保是有效的 UTF-8 文本）
+
+3. **Confirm 链接检测的安全处理**：
+   - `models.py:521` 中使用 `errors="replace"` 是安全的
+   - 但 `views.py:219` 中没有错误处理，这是潜在的问题点
+
+4. **测试覆盖**：
+   - 现有测试 `test_it_accepts_bad_unicode` 只测试了 `filter_http_body = False` 的情况
+   - 没有测试 `filter_http_body = True` 时非 UTF-8 Body 的行为
+
+---
+
 ## 二、过滤机制详解
 
 ### 2.1 过滤流程概览
