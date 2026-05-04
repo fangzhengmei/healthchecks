@@ -743,3 +743,282 @@ def handle_going_down(self) -> bool:
    - 使用 `going_down_after()` 而不是当前时间
    - 这样停机时间统计更准确
    - 通知中显示的"已停机 X 分钟"也更准确
+
+---
+
+## 10. 复杂场景分析：Start → Fail → Success 同一次检查
+
+### 10.1 场景描述
+
+用户场景：**同一次检查（同一个 rid）先收到 start，随后 fail，再收到 success**
+
+需要回答的问题：
+- 数据库状态最终以哪次事件为准？
+- Flip 记录如何创建？
+- 通知发送如何触发？
+
+### 10.2 核心代码逻辑回顾
+
+```python
+else:  # action 是 success 或 fail
+    self.last_ping = frozen_now
+    self.last_duration = None
+    
+    # 处理 running 状态
+    if self.last_start:
+        if self.last_start_rid == rid:
+            # rid 匹配：计算 last_duration，清除 last_start
+            self.last_duration = self.last_ping - self.last_start
+            self.last_start = None
+        elif action == "fail" or rid is None:
+            # fail 事件无论 rid 是否匹配，都会清除 last_start
+            # success 事件如果没有 rid，也会清除 last_start
+            self.last_start = None
+
+    # 状态更新逻辑（独立于 rid 匹配）
+    new_status = "down" if action == "fail" else "up"
+    if self.status != new_status:
+        reason = "fail" if action == "fail" else ""
+        self.create_flip(new_status, reason=reason)
+        self.status = new_status
+```
+[hc/api/models.py:499-517](hc/api/models.py#L499-L517)
+
+### 10.3 关键发现
+
+| 发现点 | 说明 |
+|--------|------|
+| **状态更新独立** | 每个 success/fail 事件都会根据自己的 action 更新状态，与 rid 匹配无关 |
+| **fail 事件强制清除 running** | 无论 rid 是否匹配，fail 事件都会清除 `last_start` |
+| **success 事件条件清除** | 只有 rid 匹配或 rid 为 None 时，success 事件才清除 `last_start` |
+| **最终状态** | 以**最后一次事件**的 action 为准 |
+
+### 10.4 场景详细分析
+
+**假设初始状态**：
+- `status = "up"`
+- `last_start = null`
+- `last_start_rid = null`
+- 配置了 down 通知和 up 通知
+
+---
+
+**事件 1：收到 start ping（rid=A）**
+
+```
+时间点：10:00
+action: "start"
+rid: A
+```
+
+**处理逻辑**：
+```python
+if action == "start":
+    self.last_start = frozen_now      # last_start = 10:00
+    self.last_start_rid = rid         # last_start_rid = A
+    # Don't update "last_ping" field.  # last_ping 不变
+```
+
+**结果**：
+| 字段 | 变化 |
+|------|------|
+| `last_start` | null → 10:00 |
+| `last_start_rid` | null → A |
+| `status` | "up"（不变） |
+| `last_ping` | 不变 |
+| Flip 记录 | 无（start 不改变状态） |
+| 通知 | 无 |
+
+---
+
+**事件 2：收到 fail ping（rid=A，同一个 rid）**
+
+```
+时间点：10:05
+action: "fail"
+rid: A
+```
+
+**处理逻辑**：
+```python
+else:  # action == "fail"
+    self.last_ping = frozen_now           # last_ping = 10:05
+    self.last_duration = None
+    
+    if self.last_start:                    # 是（last_start = 10:00）
+        if self.last_start_rid == rid:     # A == A，是
+            self.last_duration = 10:05 - 10:00 = 5min
+            self.last_start = None          # 清除！
+            self.last_start_rid = None      # 清除！
+    
+    new_status = "down"                     # 因为 action == "fail"
+    if self.status != new_status:           # "up" != "down"，是
+        reason = "fail"
+        self.create_flip("down", reason="fail")  # 创建 Flip
+        self.status = "down"                # 更新状态
+```
+
+**结果**：
+| 字段 | 变化 |
+|------|------|
+| `last_ping` | 原值 → 10:05 |
+| `last_duration` | null → 5分钟 |
+| `last_start` | 10:00 → null（被清除） |
+| `last_start_rid` | A → null（被清除） |
+| `status` | "up" → "down" |
+| Flip 记录 | 创建：up → down，reason="fail" |
+| 通知 | 触发 down 通知（sendalerts 处理后发送） |
+
+**关键点**：
+- rid 匹配，所以计算了 `last_duration = 5min`
+- `last_start` 被清除
+- 状态从 "up" 变为 "down"
+- 创建了 Flip 记录
+
+---
+
+**事件 3：收到 success ping（rid=A，同一个 rid）**
+
+```
+时间点：10:10
+action: "success"
+rid: A
+```
+
+**处理逻辑**：
+```python
+else:  # action == "success"
+    self.last_ping = frozen_now           # last_ping = 10:10
+    self.last_duration = None
+    
+    if self.last_start:                    # 否（已被事件 2 清除）
+        # 不进入此分支
+    
+    new_status = "up"                       # 因为 action == "success"
+    if self.status != new_status:           # "down" != "up"，是
+        reason = ""                          # success 事件 reason 为空
+        self.create_flip("up", reason="")   # 创建 Flip
+        self.status = "up"                  # 更新状态
+```
+
+**结果**：
+| 字段 | 变化 |
+|------|------|
+| `last_ping` | 10:05 → 10:10 |
+| `last_duration` | 5min → null |
+| `last_start` | null（不变） |
+| `status` | "down" → "up" |
+| Flip 记录 | 创建：down → up，reason="" |
+| 通知 | 触发 up 通知（sendalerts 处理后发送） |
+
+**关键点**：
+- `last_start` 已经是 null，所以不处理 running 状态
+- 状态从 "down" 变为 "up"
+- 创建了新的 Flip 记录
+
+---
+
+### 10.5 最终状态汇总
+
+| 项目 | 最终结果 |
+|------|----------|
+| **数据库 status** | `"up"`（以最后一次 success 事件为准） |
+| **Flip 记录数量** | 2 条 |
+| **Flip 记录 1** | up → down，reason="fail"，created=10:05 |
+| **Flip 记录 2** | down → up，reason=""，created=10:10 |
+| **通知发送** | 先发送 down 通知，再发送 up 通知 |
+| **last_duration** | null（被 success 事件重置） |
+| **last_start** | null（被 fail 事件清除） |
+
+### 10.6 时序图
+
+```
+时间轴：
+
+10:00 收到 start（rid=A）
+  ├── last_start = 10:00
+  ├── last_start_rid = A
+  └── status 不变（仍为 "up"）
+
+10:05 收到 fail（rid=A）
+  ├── last_ping = 10:05
+  ├── last_duration = 5min（rid 匹配）
+  ├── last_start = null（被清除）
+  ├── new_status = "down"
+  ├── status: "up" → "down"
+  ├── 创建 Flip: up→down, reason="fail"
+  └── 触发 down 通知
+
+10:10 收到 success（rid=A）
+  ├── last_ping = 10:10
+  ├── last_duration = null（重置）
+  ├── last_start 已是 null，不处理
+  ├── new_status = "up"
+  ├── status: "down" → "up"
+  ├── 创建 Flip: down→up, reason=""
+  └── 触发 up 通知
+
+最终：
+  ├── status = "up"
+  ├── Flip 记录：2 条
+  └── 通知：down 通知 + up 通知
+```
+
+### 10.7 变体场景：rid 不匹配的情况
+
+**场景**：
+- 事件 1：start（rid=A）
+- 事件 2：fail（rid=B，不匹配）
+- 事件 3：success（rid=A）
+
+**事件 2 分析（fail，rid=B 不匹配）**：
+```python
+if self.last_start:                    # 是
+    if self.last_start_rid == rid:     # A == B？否
+    elif action == "fail" or rid is None:  # action == "fail"，是
+        self.last_start = None          # 仍然清除！
+
+new_status = "down"
+# ... 创建 Flip，状态变为 down
+```
+
+**关键点**：**fail 事件无论 rid 是否匹配，都会清除 `last_start`**
+
+代码注释明确说明：
+```python
+# clear last_start (exit the "running" state) on:
+# - "success" event with no rid
+# - "fail" event, regardless of rid mismatch  ← 注意这行
+```
+[hc/api/models.py:507-510](hc/api/models.py#L507-L510)
+
+**事件 3 分析（success，rid=A）**：
+- `last_start` 已经被事件 2 清除（null）
+- 所以不处理 running 状态
+- `new_status = "up"`
+- 状态从 "down" 变为 "up"
+
+**最终结果**：与 rid 匹配的场景相同！
+
+### 10.8 设计意图理解
+
+1. **fail 事件的"终止"语义**：
+   - fail 事件表示"这次执行失败了"
+   - 无论 rid 是否匹配，都应该终止当前的 running 状态
+   - 这是一种"安全"设计：只要收到失败信号，就认为当前执行已结束
+
+2. **success 事件的"确认"语义**：
+   - success 事件表示"这次执行成功了"
+   - 只有 rid 匹配时，才认为是对应当前 running 状态的结束
+   - 这是一种"精确"设计：确保 start 和 success 是同一次执行
+
+3. **状态更新的"独立"设计**：
+   - 每个 success/fail 事件都会独立改变状态
+   - 这意味着：在短时间内收到多个事件时，状态会"闪烁"
+   - 但 Flip 记录会完整记录每次状态变化
+   - 通知也会每次状态变化都发送（如果配置了）
+
+4. **为什么这样设计？**：
+   - **可靠性优先**：宁可不厌其烦地发送通知，也不错过任何状态变化
+   - **可追溯性**：Flip 记录完整记录每次状态变化，便于事后审计
+   - **灵活性**：用户可以根据自己的需求选择使用或不使用 rid
