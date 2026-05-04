@@ -231,39 +231,62 @@ class Group(Transport):
 
 ### 4. 并发分发机制
 
-通知发送使用 `ThreadPoolExecutor` 实现并发处理：
+通知发送使用 `ThreadPoolExecutor` 实现并发处理。关于默认并发度需要注意：
+
+- `__init__` 方法中默认设置了 `max_workers=10` 和 `BoundedSemaphore(10)`
+- 但 `add_arguments` 中 `--num-workers` 参数的默认值是 `1`
+- 在 `handle` 方法中，实际使用的是传入的 `num_workers` 参数值
+
+因此，**默认并发度是 1**（不是 10）。
 
 ```python
 class Command(BaseCommand):
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
-        self.executor = ThreadPoolExecutor(max_workers=10)
-        self.seats = BoundedSemaphore(10)  # 限制并发数
+        self.executor = ThreadPoolExecutor(max_workers=10)  # 会被 handle 方法覆盖
+        self.seats = BoundedSemaphore(10)  # 会被 handle 方法覆盖
         self.shutdown = False
 
-    def process_one_flip(self) -> bool:
-        # 获取信号量，控制并发数
-        if not self.seats.acquire(timeout=1):
-            return False
+    def add_arguments(self, parser: ArgumentParser) -> None:
+        parser.add_argument(
+            "--num-workers",
+            type=int,
+            default=1,  # 默认并发度是 1
+            help="The number of concurrent worker processes to use",
+        )
+        ...
 
-        flip = Flip.objects.filter(processed=None).first()
-        if flip is None:
-            self.seats.release()
-            return False
-
-        # 标记 flip 为已处理
-        q = Flip.objects.filter(id=flip.id, processed=None)
-        num_updated = q.update(processed=now())
-        if num_updated != 1:
-            self.seats.release()
-            return True  # 其他进程已处理
-
-        # 提交到线程池执行
-        f = self.executor.submit(notify, flip)
-        f.add_done_callback(self.on_notify_done)
-        return True
+    def handle(self, num_workers: int, pool: bool, **options: Any) -> str:
+        ...
+        self.seats = BoundedSemaphore(num_workers)  # 使用参数值覆盖
+        self.executor = ThreadPoolExecutor(max_workers=num_workers)  # 使用参数值覆盖
+        ...
 ```
-[hc/api/management/commands/sendalerts.py:56-119](hc/api/management/commands/sendalerts.py#L56-L119)
+[hc/api/management/commands/sendalerts.py:56-193](hc/api/management/commands/sendalerts.py#L56-L193)
+
+### 5. 同一检查的多渠道分发顺序
+
+对于同一个检查（Check）的多个渠道，通知是**顺序发送**的，不是并发的：
+
+```python
+def notify(flip: Flip) -> str | None:
+    ...
+    channels = flip.select_channels()
+    ...
+    # 遍历所有渠道，逐个发送通知（顺序执行）
+    for ch in channels:
+        notify_start = time.time()
+        error = ch.notify(flip)  # 阻塞调用，等待完成
+        secs = time.time() - notify_start
+        ...
+```
+[hc/api/management/commands/sendalerts.py:24-53](hc/api/management/commands/sendalerts.py#L24-L53)
+
+**关键区别**：
+- **不同检查之间**：并发处理（通过 `ThreadPoolExecutor`）
+- **同一检查的不同渠道之间**：顺序处理（通过 `for` 循环）
+
+并发度控制的是同时处理多少个**检查**，而不是同一个检查的多少个**渠道**。
 
 ---
 
@@ -323,13 +346,60 @@ def request(
 **重试规则**：
 - 默认最多重试 3 次
 - 永久性错误 (`permanent=True`) 不重试
-- 测试通知 (`retry=False`) 不重试
 
-### 3. 渠道特定的重试机制
+### 3. 测试通知与正式通知的重试差异
 
-#### 3.1 邮件重试机制
+**重要修正**：只有 **Webhook 渠道**明确实现了测试通知不重试的逻辑，其他渠道没有这个差异。
 
-邮件发送有独立的重试逻辑：
+#### 3.1 Webhook 渠道的重试差异
+
+Webhook 渠道通过检查 `notification.owner is None` 来判断是否是测试通知：
+
+```python
+def notify(self, flip: Flip, notification: Notification) -> None:
+    ...
+    retry = True
+    if notification.owner is None:
+        # This is a test notification.
+        # When sending a test notification, don't retry on failures.
+        retry = False
+    ...
+    self.request(method, url, retry=retry, data=body_bytes, headers=headers)
+```
+[hc/integrations/webhook/transport.py:67-93](hc/integrations/webhook/transport.py#L67-L93)
+
+测试通知的判断逻辑在 `Channel.notify()` 中：
+
+```python
+def notify(self, flip: Flip, is_test: bool = False) -> str:
+    ...
+    n = Notification(channel=self)
+    if is_test:
+        # When sending a test notification we leave the owner field null.
+        # (the passed check is a dummy, unsaved Check instance)
+        pass
+    else:
+        n.owner = flip.owner  # 正式通知设置 owner
+    ...
+```
+[hc/api/models.py:1098-1130](hc/api/models.py#L1098-L1130)
+
+#### 3.2 其他渠道的重试行为
+
+**其他渠道（Slack、Telegram、SMS、Signal、Email 等）没有检查 `notification.owner` 来判断是否是测试通知**，它们的重试行为在测试通知和正式通知中是相同的。
+
+例如：
+- **Slack**：`self.post(self.channel.slack_webhook_url, json=self.payload(flip))` - 默认 `retry=True`
+- **Telegram**：`cls.post(cls.SM, json=payload)` - 默认 `retry=True`
+- **SMS**：`self.post(url, data=data, auth=auth)` - 默认 `retry=True`
+- **Email**：独立的重试逻辑，不区分测试/正式
+- **Signal**：独立的重试逻辑，不区分测试/正式
+
+### 4. 渠道特定的重试机制
+
+#### 4.1 邮件重试机制
+
+邮件发送有独立的重试逻辑，不区分测试通知和正式通知：
 
 ```python
 class EmailThread(Thread):
@@ -353,29 +423,13 @@ class EmailThread(Thread):
 ```
 [hc/lib/emails.py:15-37](hc/lib/emails.py#L15-L37)
 
-#### 3.2 Signal 重试机制
+#### 4.2 Signal 重试机制
 
-Signal 通知有独立的重试逻辑：
+Signal 通知有独立的重试逻辑，不区分测试通知和正式通知：
 
 ```python
 def notify(self, flip: Flip, notification: Notification) -> None:
-    if not settings.SIGNAL_CLI_SOCKET:
-        raise TransportError("Signal notifications are not enabled")
-
-    from hc.api.models import TokenBucket
-
-    if not TokenBucket.authorize_signal(self.channel.phone.value):
-        raise TransportError("Rate limit exceeded")
-
-    ctx = {
-        "flip": flip,
-        "check": flip.owner,
-        "status": flip.new_status,
-        "ping": self.last_ping(flip),
-        "down_checks": self.down_checks(flip.owner),
-    }
-    text = self.tmpl("signal_message.html", **ctx)
-    
+    ...
     # Signal 最多重试 2 次
     tries_left = 2
     while True:
@@ -396,11 +450,11 @@ def notify(self, flip: Flip, notification: Notification) -> None:
 ```
 [hc/integrations/signal/transport.py:158-188](hc/integrations/signal/transport.py#L158-L188)
 
-### 4. 永久性错误处理
+### 5. 永久性错误处理
 
 某些错误被标记为永久性错误，会导致渠道被自动禁用：
 
-#### 4.1 Telegram 永久性错误
+#### 5.1 Telegram 永久性错误
 
 ```python
 @classmethod
@@ -432,7 +486,7 @@ def raise_for_response(cls, response: curl.Response) -> NoReturn:
 ```
 [hc/integrations/telegram/transport.py:28-51](hc/integrations/telegram/transport.py#L28-L51)
 
-#### 4.2 Slack 永久性错误
+#### 5.2 Slack 永久性错误
 
 ```python
 @classmethod
@@ -455,7 +509,7 @@ def raise_for_response(cls, response: curl.Response) -> NoReturn:
 ```
 [hc/integrations/slack/transport.py:93-112](hc/integrations/slack/transport.py#L93-L112)
 
-#### 4.3 SMS 永久性错误
+#### 5.3 SMS 永久性错误
 
 ```python
 @classmethod
@@ -475,7 +529,7 @@ def raise_for_response(cls, response: curl.Response) -> NoReturn:
 ```
 [hc/integrations/sms/transport.py:23-34](hc/integrations/sms/transport.py#L23-L34)
 
-### 5. 错误记录和渠道禁用
+### 6. 错误记录和渠道禁用
 
 `Channel.notify()` 方法处理错误记录和渠道禁用：
 
@@ -521,9 +575,9 @@ def notify(self, flip: Flip, is_test: bool = False) -> str:
 ```
 [hc/api/models.py:1098-1130](hc/api/models.py#L1098-L1130)
 
-### 6. 特殊错误处理
+### 7. 特殊错误处理
 
-#### 6.1 速率限制处理
+#### 7.1 速率限制处理
 
 Telegram 和 Signal 都有速率限制处理：
 
@@ -537,7 +591,7 @@ def notify(self, flip: Flip, notification: Notification) -> None:
 ```
 [hc/integrations/telegram/transport.py:65-69](hc/integrations/telegram/transport.py#L65-L69)
 
-#### 6.2 特殊迁移处理
+#### 7.2 特殊迁移处理
 
 Telegram 支持群组迁移后的自动更新：
 
@@ -552,7 +606,7 @@ def notify(self, flip: Flip, notification: Notification) -> None:
 ```
 [hc/integrations/telegram/transport.py:84-89](hc/integrations/telegram/transport.py#L84-L89)
 
-#### 6.3 配额超限处理
+#### 7.3 配额超限处理
 
 SMS 有月度配额限制：
 
@@ -581,10 +635,35 @@ def notify(self, flip: Flip, notification: Notification) -> None:
 - **分组分发**：`Group` 渠道支持将多个子渠道组合为一个逻辑组
 - **并发处理**：使用 `ThreadPoolExecutor` 处理多个检查的告警
 - **智能选择**：`select_channels()` 方法根据状态、禁用状态、noop 标志过滤渠道
+- **默认并发度**：`--num-workers` 参数默认值为 **1**（不是 10）
 
 ### 失败处理逻辑
 - **通用重试**：`HttpTransport` 实现最多 3 次重试，永久性错误不重试
 - **渠道特定重试**：Email（3次，间隔1秒）、Signal（2次）
+- **测试通知与正式通知的重试差异**：
+  - **只有 Webhook 渠道**：测试通知 `retry=False`（不重试），正式通知 `retry=True`（最多3次重试）
+  - **其他渠道**：不区分测试通知和正式通知，重试行为相同
 - **永久性错误**：某些错误（如用户拉黑、群组删除、无效号码）会自动禁用渠道
 - **错误记录**：错误信息记录在 `Notification.error` 和 `Channel.last_error`
 - **特殊处理**：速率限制、配额超限、Telegram 群组迁移等场景有专门处理
+
+---
+
+## 五、修正记录
+
+### 2026-05-04 修正内容
+
+1. **默认并发度修正**：
+   - 之前错误认为默认并发度是 10
+   - 实际上 `__init__` 中的 10 会被 `handle` 方法中的 `--num-workers` 参数覆盖
+   - 正确的默认并发度是 **1**（`add_arguments` 中定义的默认值）
+
+2. **测试通知与正式通知的重试差异修正**：
+   - 之前错误认为所有渠道都有测试通知不重试的差异
+   - 实际上只有 **Webhook 渠道**明确检查 `notification.owner is None` 并设置 `retry=False`
+   - 其他渠道（Slack、Telegram、SMS、Signal、Email 等）没有这个差异
+
+3. **同一检查的多渠道分发顺序澄清**：
+   - 不同检查之间是并发处理的（通过 `ThreadPoolExecutor`）
+   - 同一检查的不同渠道之间是顺序处理的（通过 `for` 循环）
+   - 并发度控制的是同时处理多少个**检查**，而不是同一个检查的多少个**渠道**
