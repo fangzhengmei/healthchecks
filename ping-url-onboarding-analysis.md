@@ -839,5 +839,21 @@ Email Ping: {ping_key}+db-backups@hc-ping.com
 
 | 场景 | 替换方式 | 特点 |
 |-----|---------|------|
-| Usage Examples 模态框 | Django 模板变量 `{{ ping_url }}` | 每个 check 有专属的真实 URL，复制即可用 |
-| 文档
+| Usage Examples 模态框（Cron 示例） | Django 模板变量 `{{ ping_url }}` | 每个 check 有专属的真实 URL，复制即可用 |
+| Usage Examples 模态框（通用语言示例） | Django 模板变量 `{{ ping_url }}` | 每个 check 有专属的真实 URL，复制即可用 |
+| 文档页面（CI 示例，如 GitHub Actions） | `_replace_placeholders()` 函数 | 使用通用占位符 `your-uuid-here`，适合文档场景 |
+| 文档页面（第三方资源，如 Terraform） | 无替换，用户手动配置 | 社区提供的第三方库/工具，需要自行集成 |
+| API 响应 | 硬编码 UUID 格式 | 始终返回 UUID 格式，不考虑 slug 配置 |
+
+### 6.5 安全考虑
+
+- Ping Key 生成使用 `token_urlsafe(16)`，约 113 位熵值
+- Slug 模式中，slug 可以公开（硬编码在脚本中），真正的 secret 是 ping key
+- UUID 模式中，UUID 本身就是 secret（UUID 地址空间足够大，难以猜测）
+
+### 6.6 用户体验优化
+
+- **点击复制**：`click-to-copy` class 让用户可以一键复制 URL 和示例代码
+- **即时反馈**："Ping Now!" 点击后显示 "Success!"，鼠标移出后恢复
+- **状态轮询**：自动定期更新状态，无需手动刷新
+- **Tooltip 提示**：复制功能有 "Click to copy" / "Copied!" 反馈
