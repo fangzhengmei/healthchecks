@@ -625,22 +625,183 @@ def unsubscribe(request: HttpRequest, code: UUID, signed_token: str) -> HttpResp
         return render(request, "front/unsubscribe_success.html")
 ```
 
-### 4.4 基于状态的通知过滤
+### 4.4 后台发送Worker中的过滤机制
 
+#### 核心代码位置
+- `hc/api/management/commands/sendalerts.py` - 后台告警发送Worker
+- `hc/api/models.py:1334-1352` - Flip.select_channels方法
+- `hc/api/models.py:1098-1100` - Channel.notify中的is_noop检查
+- `hc/integrations/email/transport.py:69-73` - Email.is_noop具体实现
+
+#### 发送Worker主循环
+
+```python
+# hc/api/management/commands/sendalerts.py:182-213
+def handle(self, num_workers: int, pool: bool, **options: Any) -> str:
+    # ...
+    while not self.shutdown:
+        # 为超时的检查创建Flips（状态变更事件）
+        while self.handle_going_down() and not self.shutdown:
+            pass
+
+        # 提交未处理的Flips到线程池执行
+        while self.process_one_flip() and not self.shutdown:
+            pass
+
+        # 所有worker忙或没有未处理的Flips，等待2秒
+        if not self.shutdown:
+            time.sleep(2)
+```
+
+#### 处理单个状态变更（Flip）
+
+```python
+# hc/api/management/commands/sendalerts.py:89-119
+def process_one_flip(self) -> bool:
+    """查找未处理的flip，发送通知
+    
+    返回True表示主循环应立即继续
+    返回False表示主循环应等待一段时间再继续
+    """
+
+    if not self.seats.acquire(timeout=1):
+        return False  # Worker忙，主线程应等待
+
+    # 查找第一个未处理的flip
+    flip = Flip.objects.filter(processed=None).first()
+    if flip is None:
+        self.seats.release()
+        return False  # 没有工作，主线程应等待
+
+    # 乐观锁：标记flip为已处理
+    q = Flip.objects.filter(id=flip.id, processed=None)
+    num_updated = q.update(processed=now())
+    if num_updated != 1:
+        self.seats.release()
+        # 没有更新成功：其他sendalerts进程已抢先处理
+        return True
+
+    # 提交到线程池执行
+    f = self.executor.submit(notify, flip)
+    f.add_done_callback(self.on_notify_done)
+    return True
+```
+
+#### 通知执行函数
+
+```python
+# hc/api/management/commands/sendalerts.py:24-53
+def notify(flip: Flip) -> str | None:
+    # 线程池中的线程可能有已打开的db连接，如果最近未运行
+    # db连接可能已超时，调用close_old_connections()确保有可用连接
+    if not connection.in_atomic_block:
+        close_old_connections()
+
+    # 设置或清除后续持续提醒的日期
+    check = flip.owner
+    check.project.update_next_nag_dates()
+    
+    # 【关键】筛选需要通知的渠道
+    channels = flip.select_channels()
+    if not channels:
+        return None
+
+    # 遍历渠道发送通知
+    send_start = now()
+    logs = [f"{check.code} goes {flip.new_status}"]
+    for ch in channels:
+        notify_start = time.time()
+        error = ch.notify(flip)  # 这里会再次检查is_noop
+        # ...记录日志
+```
+
+#### Flip.select_channels 渠道筛选逻辑
+
+```python
+# hc/api/models.py:1334-1352
+def select_channels(self) -> list[Channel]:
+    """返回需要通知的渠道列表
+    
+    筛选规则：
+    * 排除 new->up 和 paused->up 转换
+    * 排除禁用的渠道
+    * 排除 transport.is_noop(status) 返回True的渠道
+    * 按last_notify_duration排序（耗时短的优先）
+    """
+
+    # 第一层过滤：状态转换过滤
+    # 不发送 new->up 和 paused->up 的通知
+    # （新创建的检查第一次成功、暂停的检查恢复成功，不通知）
+    if self.new_status == "up" and self.old_status in ("new", "paused"):
+        return []
+
+    if self.new_status not in ("up", "down"):
+        raise NotImplementedError(f"Unexpected status: {self.new_status}")
+
+    # 第二层过滤：排除禁用的渠道
+    q = self.owner.channel_set.exclude(disabled=True)
+    
+    # 按上次通知耗时排序（快的优先，避免慢渠道阻塞其他通知）
+    q = q.order_by(F("last_notify_duration").asc(nulls_last=True))
+    
+    # 第三层过滤：基于状态偏好的过滤（is_noop检查）
+    return [ch for ch in q if not ch.transport.is_noop(self.new_status)]
+```
+
+#### 禁用渠道过滤详解
+
+在 `select_channels` 中：
+```python
+# 排除 disabled=True 的渠道
+q = self.owner.channel_set.exclude(disabled=True)
+```
+
+**禁用渠道的场景**：
+1. **用户主动禁用**：用户在集成页面禁用某个通知渠道
+2. **退订导致禁用**：用户点击告警邮件中的退订链接
+   ```python
+   # hc/integrations/email/views.py:113
+   Channel.objects.filter(id=channel.id).update(disabled=True)
+   ```
+3. **发送错误导致禁用**：永久错误（如邮箱不存在）会导致渠道被禁用
+   ```python
+   # hc/api/models.py:1118-1119
+   except transports.TransportError as e:
+       disabled = True if e.permanent else disabled
+   ```
+
+#### 基于状态的通知过滤（is_noop）
+
+在 `select_channels` 的最后一步：
+```python
+return [ch for ch in q if not ch.transport.is_noop(self.new_status)]
+```
+
+**基类定义**：
+```python
+# hc/api/transports.py:61-70
+class Transport:
+    def is_noop(self, status: str) -> bool:
+        """如果transport会忽略当前状态，返回True
+        
+        在Webhook子类中被重写，用户可以配置up和down事件的webhook url，且都是可选的
+        """
+        return False
+```
+
+**Email渠道的具体实现**：
 ```python
 # hc/integrations/email/transport.py:69-73
 def is_noop(self, status: str) -> bool:
     if status == "down":
+        # 如果是down事件，且用户关闭了down通知，则跳过
         return not self.channel.email.notify_down
     else:
+        # 如果是up事件，且用户关闭了up通知，则跳过
         return not self.channel.email.notify_up
 ```
 
-用户可以为每个邮件渠道设置：
-- `notify_down`：是否接收down状态通知
-- `notify_up`：是否接收up状态通知
-
-配置存储在 `Channel.value` 中，通过 `EmailConf` 模型解析：
+**配置存储**：
 ```python
 # hc/api/models.py:895-906
 class EmailConf(BaseModel):
@@ -649,9 +810,369 @@ class EmailConf(BaseModel):
     notify_down: bool = Field(alias="down")
 ```
 
+**配置解析**：
+- 如果 `value` 是纯邮箱字符串（非JSON），默认 `up=True, down=True`
+- 如果 `value` 是JSON格式，解析 `up` 和 `down` 字段
+
+#### 双层过滤机制总结
+
+告警发送路径中有**两层过滤**：
+
+| 过滤层级 | 位置 | 过滤条件 |
+|---------|------|---------|
+| 第一层 | `Flip.select_channels()` | 状态转换过滤 + 禁用渠道过滤 + is_noop预过滤 |
+| 第二层 | `Channel.notify()` | 再次检查 `is_noop()` |
+
+**为什么需要两层检查？**
+- `select_channels` 中的检查用于快速筛选，减少不必要的通知记录创建
+- `Channel.notify` 中的检查是防御性编程，确保即使在测试或其他场景下也不会发送错误的通知
+
+```python
+# hc/api/models.py:1098-1100
+def notify(self, flip: Flip, is_test: bool = False) -> str:
+    # 再次检查是否需要跳过
+    if self.transport.is_noop(flip.new_status):
+        return "no-op"
+    # ...
+```
+
 ---
 
-## 5. 邮件模板系统
+## 5. 定期报告和持续提醒的调度循环
+
+### 5.1 调度器核心代码位置
+- `hc/api/management/commands/sendreports.py` - 报告和持续提醒调度器
+- `hc/accounts/models.py:342-349` - update_next_nag_date方法
+- `hc/accounts/models.py:351-376` - choose_next_report_date方法
+
+### 5.2 调度器主循环
+
+```python
+# hc/api/management/commands/sendreports.py:100-132
+def handle(self, loop: bool, **options: Any) -> str:
+    self.shutdown = False
+    signal.signal(signal.SIGTERM, self.on_signal)
+    signal.signal(signal.SIGINT, self.on_signal)
+
+    self.stdout.write("sendreports is now running")
+    while not self.shutdown:
+        # db连接可能已超时，确保有可用连接
+        if not connection.in_atomic_block:
+            close_old_connections()
+
+        # 第一阶段：处理到期的定期报告
+        while not self.shutdown and self.handle_one_report():
+            pass
+
+        # 第二阶段：处理到期的持续提醒（Nags）
+        while not self.shutdown and self.handle_one_nag():
+            pass
+
+        if not loop:
+            break  # 非循环模式，执行一次退出
+
+        # 循环模式：睡眠60秒后再次检查
+        for i in range(0, 60):
+            if not self.shutdown:
+                time.sleep(1)
+
+    return "Done."
+```
+
+### 5.3 定期报告调度处理
+
+```python
+# hc/api/management/commands/sendreports.py:34-67
+def handle_one_report(self) -> bool:
+    # 查询条件1：next_report_date < 当前时间（已到期）
+    report_due = Q(next_report_date__lt=now())
+    # 查询条件2：next_report_date 为 null（从未调度过）
+    report_not_scheduled = Q(next_report_date__isnull=True)
+
+    # 筛选：到期或未调度，且报告未关闭
+    q = Profile.objects.filter(report_due | report_not_scheduled)
+    q = q.exclude(reports="off")
+    profile = q.first()
+
+    if profile is None:
+        # 没有匹配的Profile，当前无事可做
+        return False
+
+    # 【乐观锁】：使用当前next_report_date值作为条件
+    # 确保在并发场景下不会重复发送
+    qq = Profile.objects.filter(
+        id=profile.id, next_report_date=profile.next_report_date
+    )
+
+    # 场景1：从未调度过 → 先调度，不发送
+    if profile.next_report_date is None:
+        qq.update(next_report_date=profile.choose_next_report_date())
+        return True
+
+    # 场景2：已到期 → 发送报告 + 调度下次
+    # 先更新下次发送时间（乐观锁）
+    num_updated = qq.update(next_report_date=profile.choose_next_report_date())
+    if num_updated != 1:
+        # next_report_date已被其他进程更新，跳过
+        return True
+
+    # 发送报告
+    if profile.send_report():
+        self.stdout.write(self.tmpl % profile.user.email)
+        # 发送后暂停3秒，避免触发邮件服务配额限制
+        self.pause()
+
+    return True
+```
+
+### 5.4 持续提醒（Nag）调度处理
+
+```python
+# hc/api/management/commands/sendreports.py:69-93
+def handle_one_nag(self) -> bool:
+    now_value = now()
+    # 查询条件：next_nag_date < 当前时间，且nag_period不是"禁用"
+    q = Profile.objects.filter(next_nag_date__lt=now_value)
+    q = q.exclude(nag_period=NO_NAG)
+    profile = q.first()
+
+    if profile is None:
+        return False
+
+    # 乐观锁
+    qq = Profile.objects.filter(id=profile.id, next_nag_date=profile.next_nag_date)
+
+    # 【先更新时间，后发送】
+    # 与报告不同，nag是持续提醒，先更新下次时间避免重复发送
+    num_updated = qq.update(next_nag_date=now_value + profile.nag_period)
+    if num_updated != 1:
+        # 已被其他进程更新，跳过
+        return True
+
+    # 发送持续提醒（nag=True表示只包含当前down的检查）
+    if profile.send_report(nag=True):
+        self.stdout.write(f"Sent nag to {profile.user.email}")
+        self.pause()
+    else:
+        # 发送失败：可能是没有down的检查了
+        # 清空next_nag_date，直到有检查down时再重新调度
+        profile.next_nag_date = None
+        profile.save()
+
+    return True
+```
+
+### 5.5 持续提醒的触发条件更新
+
+当检查状态变化时，会更新项目所有成员的 `next_nag_date`：
+
+```python
+# hc/api/management/commands/sendalerts.py:32-34
+def notify(flip: Flip) -> str | None:
+    # ...
+    check = flip.owner
+    check.project.update_next_nag_dates()  # 【关键】
+    # ...
+```
+
+**update_next_nag_dates 实现**：
+```python
+# hc/accounts/models.py:477-487
+def update_next_nag_dates(self) -> None:
+    """更新项目所有成员的next_nag_date"""
+
+    # 筛选条件：项目所有者 + 项目成员，且nag_period不是禁用
+    is_owner = Q(user_id=self.owner_id)
+    is_member = Q(user__memberships__project=self)
+    q = Profile.objects.filter(is_owner | is_member).exclude(nag_period=NO_NAG)
+
+    # 遍历每个符合条件的Profile，更新其nag调度
+    for profile in q:
+        profile.update_next_nag_date()
+```
+
+**update_next_nag_date 实现**：
+```python
+# hc/accounts/models.py:342-349
+def update_next_nag_date(self) -> None:
+    # 检查用户有权访问的所有项目中是否有down的检查
+    any_down = self.checks_from_all_projects().filter(status="down").exists()
+
+    # 条件1：有检查down + 未设置下次nag日期 + 已启用nag
+    if any_down and self.next_nag_date is None and self.nag_period:
+        self.next_nag_date = now() + self.nag_period
+        self.save(update_fields=["next_nag_date"])
+    
+    # 条件2：没有检查down + 已设置下次nag日期
+    elif not any_down and self.next_nag_date:
+        self.next_nag_date = None
+        self.save(update_fields=["next_nag_date"])
+```
+
+### 5.6 下次发送时间计算
+
+#### 定期报告下次时间计算
+
+```python
+# hc/accounts/models.py:351-376
+def choose_next_report_date(self) -> datetime | None:
+    """计算下一次月度/周度报告的目标日期
+    
+    发送时间规则：
+    - 月度报告：每月1日，用户时区的 9AM-11AM 之间
+    - 周度报告：每周一，用户时区的 9AM-11AM 之间
+    - 日报：每天，用户时区的 9AM-11AM 之间
+    """
+    if self.reports == "off":
+        return None
+
+    # 获取当前时间在用户时区的表示
+    dt = now().astimezone(ZoneInfo(self.tz))
+    
+    # 在 9:00-11:00 之间随机选择分钟
+    # 避免所有用户在同一时间收到邮件，分散负载
+    dt = dt.replace(hour=9, minute=0) + td(minutes=random.randrange(0, 120))
+
+    # 找到未来的第一个符合条件的日期
+    while True:
+        dt += td(days=1)
+        if self.reports == "daily":
+            return dt  # 日报：明天
+        if self.reports == "monthly" and dt.day == 1:
+            return dt  # 月报：下个月1日
+        elif self.reports == "weekly" and dt.weekday() == 0:
+            return dt  # 周报：下周一
+```
+
+#### 持续提醒下次时间计算
+
+持续提醒的下次时间有两种计算方式：
+
+**方式1：状态变化时触发**（在 `update_next_nag_date` 中）
+```python
+# 当有检查down时，设置为：当前时间 + nag_period
+self.next_nag_date = now() + self.nag_period
+```
+
+**方式2：发送后调度**（在 `handle_one_nag` 中）
+```python
+# 发送nag后，更新为：当前时间 + nag_period
+qq.update(next_nag_date=now_value + profile.nag_period)
+```
+
+### 5.7 乐观锁机制详解
+
+#### 为什么需要乐观锁？
+
+在分布式部署场景下，可能有多个 `sendreports` 进程同时运行。如果没有锁机制，可能会导致：
+- 同一报告被重复发送多次
+- 同一持续提醒被重复发送
+
+#### 乐观锁实现模式
+
+```python
+# 步骤1：读取记录
+profile = q.first()
+
+# 步骤2：使用读取时的字段值作为更新条件
+qq = Profile.objects.filter(
+    id=profile.id, 
+    next_report_date=profile.next_report_date  # 【关键】乐观锁条件
+)
+
+# 步骤3：执行更新
+num_updated = qq.update(next_report_date=...)
+
+# 步骤4：检查更新行数
+if num_updated != 1:
+    # 其他进程已更新，跳过
+    return True
+```
+
+#### 报告与Nag的调度顺序差异
+
+| 类型 | 调度顺序 | 原因 |
+|-----|---------|-----|
+| 定期报告 | **先发送，后调度下次** | 报告是周期性摘要，发送失败也没关系，下次再发 |
+| 持续提醒 | **先调度下次，后发送** | Nag是紧急提醒，如果发送失败（如没有down的检查了），需要清除调度 |
+
+### 5.8 调度循环数据流
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    sendreports 主循环 (每60秒)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │           第一阶段：处理定期报告                            │  │
+│  ├───────────────────────────────────────────────────────────┤  │
+│  │                                                           │  │
+│  │  SELECT * FROM profile                                    │  │
+│  │  WHERE (next_report_date < NOW()                         │  │
+│  │         OR next_report_date IS NULL)                     │  │
+│  │    AND reports != 'off'                                   │  │
+│  │  ORDER BY id LIMIT 1                                      │  │
+│  │                                                           │  │
+│  │  ┌─────────────────────────────────────────────────────┐ │  │
+│  │ │ 场景1: next_report_date IS NULL                       │ │  │
+│  │ │   → 只调度，不发送                                    │ │  │
+│  │ │   UPDATE profile SET next_report_date = ?            │ │  │
+│  │ │   WHERE id = ? AND next_report_date IS NULL          │ │  │
+│  │ └─────────────────────────────────────────────────────┘ │  │
+│  │                                                           │  │
+│  │  ┌─────────────────────────────────────────────────────┐ │  │
+│  │ │ 场景2: next_report_date < NOW()                      │ │  │
+│  │ │   → 先更新下次时间，再发送                            │ │  │
+│  │ │   UPDATE profile SET next_report_date = ?            │ │  │
+│  │ │   WHERE id = ? AND next_report_date = ?              │ │  │
+│  │ │   IF 1 row updated:                                   │ │  │
+│  │ │      profile.send_report()                            │ │  │
+│  │ └─────────────────────────────────────────────────────┘ │  │
+│  │                                                           │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │           第二阶段：处理持续提醒 (Nags)                     │  │
+│  ├───────────────────────────────────────────────────────────┤  │
+│  │                                                           │  │
+│  │  SELECT * FROM profile                                    │  │
+│  │  WHERE next_nag_date < NOW()                              │  │
+│  │    AND nag_period != '0'                                  │  │
+│  │  ORDER BY id LIMIT 1                                      │  │
+│  │                                                           │  │
+│  │  ┌─────────────────────────────────────────────────────┐ │  │
+│  │ │ 【先更新时间，后发送】                                 │ │  │
+│  │ │ UPDATE profile SET next_nag_date = NOW() + nag_period│ │  │
+│  │ │ WHERE id = ? AND next_nag_date = ?                    │ │  │
+│  │ │                                                        │ │  │
+│  │ │ IF 1 row updated:                                      │ │  │
+│  │ │   if profile.send_report(nag=True):                    │ │  │
+│  │ │       # 发送成功                                        │ │  │
+│  │ │   else:                                                 │ │  │
+│  │ │       # 没有down的检查了，清除调度                      │ │  │
+│  │ │       profile.next_nag_date = NULL                     │ │  │
+│  │ │       profile.save()                                    │ │  │
+│  │ └─────────────────────────────────────────────────────┘ │  │
+│  │                                                           │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.9 持续提醒触发时机
+
+持续提醒的 `next_nag_date` 会在以下时机被更新：
+
+| 触发时机 | 触发位置 | 更新逻辑 |
+|---------|---------|---------|
+| 检查状态变化 | `sendalerts.py:34` | 调用 `project.update_next_nag_dates()` |
+| 发送Nag后 | `sendreports.py:80` | `next_nag_date = now + nag_period` |
+| 没有down的检查 | `sendreports.py:90` | `next_nag_date = None` |
+| 用户修改nag设置 | `accounts/views.py:577-583` | 调用 `update_next_nag_date()` |
+
+---
+
+## 6. 邮件模板系统
 
 ### 5.1 邮件发送核心模块
 
