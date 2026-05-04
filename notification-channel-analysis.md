@@ -292,21 +292,134 @@ def notify(flip: Flip) -> str | None:
 
 ## 三、发送失败后的处理逻辑
 
-### 1. 错误类型定义
+### 1. 告警发送前标记为已处理的机制
 
-系统定义了 `TransportError` 异常类，支持标记错误是否为永久性错误：
+**重要机制**：`Flip` 对象在通知发送**之前**就被标记为已处理。
 
 ```python
-class TransportError(Exception):
-    def __init__(self, message: str, permanent: bool = False) -> None:
-        self.message = message
-        self.permanent = permanent
+def process_one_flip(self) -> bool:
+    """Find unprocessed flip, send notifications.
+    ...
+    """
+
+    if not self.seats.acquire(timeout=1):
+        return False
+
+    # 1. 查找未处理的 Flip
+    flip = Flip.objects.filter(processed=None).first()
+    if flip is None:
+        self.seats.release()
+        return False
+
+    # 2. 【关键】在发送通知之前，先标记为已处理
+    # Mark the flip as processed:
+    q = Flip.objects.filter(id=flip.id, processed=None)
+    num_updated = q.update(processed=now())  # ← 这里设置 processed = 当前时间
+    if num_updated != 1:
+        self.seats.release()
+        # Nothing got updated: another sendalerts process got there first.
+        return True
+
+    statsd.incr("hc.sendalerts.processFlip")
+    
+    # 3. 【关键】提交到线程池执行通知发送（在标记已处理之后）
+    f = self.executor.submit(notify, flip)  # ← 这里才开始发送通知
+    f.add_done_callback(self.on_notify_done)
+    return True
 ```
-[hc/api/transports.py:41-44](hc/api/transports.py#L41-L44)
+[hc/api/management/commands/sendalerts.py:89-119](hc/api/management/commands/sendalerts.py#L89-L119)
 
-### 2. 通用重试机制
+**执行顺序**：
+1. 查找 `processed=None` 的 Flip
+2. **更新 `processed=now()`** —— 标记为已处理
+3. 提交到线程池执行 `notify(flip)` —— 发送通知
 
-`HttpTransport` 类实现了通用的重试机制：
+### 2. 为什么单次发送异常不会自动再次分发
+
+#### 2.1 核心原因：Flip 的 `processed` 字段一旦被设置，就不会被 `sendalerts` 再次处理。
+
+```python
+# sendalerts 只查询条件
+flip = Flip.objects.filter(processed=None).first()  # 只查询 processed 为 null 的记录
+```
+[hc/api/management/commands/sendalerts.py:103](hc/api/management/commands/sendalerts.py#L103)
+
+数据库层面还有一个部分索引优化这个查询：
+
+```python
+class Flip(models.Model):
+    ...
+    class Meta:
+        indexes = [
+            # For quickly looking up unprocessed flips.
+            # Used in the sendalerts management command.
+            models.Index(
+                fields=["processed"],
+                name="api_flip_not_processed",
+                condition=models.Q(processed=None),  # 只索引 processed 为 null 的记录
+            ),
+            ...
+        ]
+```
+[hc/api/models.py:1312-1326](hc/api/models.py#L1312-L1326)
+
+#### 2.2 没有自动重置机制
+
+系统中**没有任何代码**会在通知发送失败后重置 `Flip.processed` 为 `None`。
+
+即使通知发送失败：
+- `Flip.processed` 保持已设置的时间值
+- `sendalerts` 命令不会再次查询这个 Flip
+- 没有自动重发机制
+
+#### 2.3 设计意图分析
+
+这种设计的原因可能包括：
+
+1. **避免重复通知**：如果 `processed` 标记后重置，可能导致同一事件被多次通知
+2. **并发安全**：使用 `Flip.objects.filter(id=flip.id, processed=None).update(...)` 是原子操作，确保多个 `sendalerts` 进程不会处理同一个 Flip
+3. **失败应由其他机制处理**：错误通过 `Notification.error` 和 `Channel.last_error` 记录，由人工或其他机制处理
+
+### 3. 完整的失败处理路径
+
+失败处理是一个**三层防御**体系：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    第一层：渠道内部重试                            │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ HttpTransport: 最多 3 次重试（永久性错误不重试）           │   │
+│  │ Email: 最多 3 次重试，间隔 1 秒                             │   │
+│  │ Signal: 最多 2 次重试                                     │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ 失败
+┌─────────────────────────────────────────────────────────────────┐
+│                    第二层：错误状态落库                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Notification.error: 记录具体错误信息                    │   │
+│  │ Channel.last_error: 记录渠道最后一次错误                   │   │
+│  │ Channel.last_notify: 记录最后一次通知时间                  │   │
+│  │ Channel.last_notify_duration: 记录最后一次通知耗时          │   │
+│  │ Channel.disabled: 永久性错误会设置为 True                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ 失败
+┌─────────────────────────────────────────────────────────────────┐
+│                    第三层：人工恢复                              │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ 1. 通过管理后台查看错误信息                               │   │
+│  │ 2. 修复问题（更新配置、修复网络等）                       │   │
+│  │ 3. 如果渠道被禁用，重新启用                               │   │
+│  │ 4. 通过测试按钮验证渠道                                   │   │
+│  │ 5. 等待下一次状态变化触发新通知                           │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4. 第一层：渠道内部重试
+
+#### 4.1 HttpTransport 通用重试机制
 
 ```python
 @classmethod
@@ -322,36 +435,198 @@ def request(
     headers: curl.Headers = None,
     auth: curl.Auth = None,
 ) -> None:
-    tries_left = 3 if retry else 1
+    tries_left = 3 if retry else 1  # 默认最多 3 次尝试
     while True:
         try:
-            return cls._request(
-                method,
-                url,
-                params=params,
-                data=data,
-                json=json,
-                headers=headers,
-                auth=auth,
-            )
+            return cls._request(...)
         except TransportError as e:
             # 永久性错误不重试
             tries_left = 0 if e.permanent else tries_left - 1
-            # 没有重试次数了，重新抛出异常
             if tries_left == 0:
                 raise e
 ```
 [hc/api/transports.py:152-183](hc/api/transports.py#L152-L183)
 
 **重试规则**：
-- 默认最多重试 3 次
-- 永久性错误 (`permanent=True`) 不重试
+- `retry=True`：最多 3 次尝试（1 次正常 + 2 次重试）
+- `retry=False`：只尝试 1 次
+- `permanent=True`：不重试，立即抛出异常
 
-### 3. 测试通知与正式通知的重试差异
+#### 4.2 Email 独立重试机制
+
+```python
+class EmailThread(Thread):
+    MAX_TRIES = 3
+
+    def run(self) -> None:
+        for attempt in range(0, self.MAX_TRIES):
+            try:
+                # 确保每次重试都创建新连接
+                self.message.connection = None
+                self.message.send()
+                return
+            except (SMTPServerDisconnected, SMTPDataError) as e:
+                if attempt + 1 == self.MAX_TRIES:
+                    raise e
+                time.sleep(1)  # 等待 1 秒后重试
+```
+[hc/lib/emails.py:15-37](hc/lib/emails.py#L15-L37)
+
+#### 4.3 Signal 独立重试机制
+
+```python
+def notify(self, flip: Flip, notification: Notification) -> None:
+    ...
+    # Signal 最多重试 2 次
+    tries_left = 2
+    while True:
+        try:
+            return self.send(self.channel.phone.value, text)
+        except SignalRateLimitFailure as e:
+            # 速率限制错误，发送提醒邮件
+            self.channel.send_signal_captcha_alert(e.token, e.reply.decode())
+            ...
+            raise e
+        except TransportError as e:
+            tries_left -= 1
+            if e.permanent or tries_left == 0:
+                raise e
+            logger.debug("Retrying signal-cli call")
+```
+[hc/integrations/signal/transport.py:158-188](hc/integrations/signal/transport.py#L158-L188)
+
+### 5. 第二层：错误状态落库
+
+#### 5.1 Notification 记录
+
+```python
+class Notification(models.Model):
+    code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+    # owner is null for test notifications, produced by the "Test!" button
+    owner = models.ForeignKey(Check, models.CASCADE, null=True)
+    check_status = models.CharField(max_length=6)
+    channel = models.ForeignKey(Channel, models.CASCADE)
+    created = models.DateTimeField(default=now)
+    error = models.CharField(max_length=200, blank=True)  # 错误信息
+```
+[hc/api/models.py:1282-1290](hc/api/models.py#L1282-L1290)
+
+#### 5.2 Channel 状态更新
+
+```python
+def notify(self, flip: Flip, is_test: bool = False) -> str:
+    ...
+    n = Notification(channel=self)
+    ...
+    n.error = "Sending"
+    n.save()
+
+    start, error, disabled = now(), "", self.disabled
+    try:
+        self.transport.notify(flip, notification=n)
+
+    except transports.TransportError as e:
+        # 永久性错误会禁用渠道
+        disabled = True if e.permanent else disabled
+        error = e.message
+
+    # 更新 Notification 错误信息
+    Notification.objects.filter(id=n.id).update(error=error)
+    
+    # 更新 Channel 状态
+    Channel.objects.filter(id=self.id).update(
+        last_notify=start,                    # 最后一次通知时间
+        last_notify_duration=now() - start,   # 通知耗时
+        last_error=error,                      # 最后一次错误
+        disabled=disabled,                      # 是否禁用
+    )
+
+    return error
+```
+[hc/api/models.py:1098-1130](hc/api/models.py#L1098-L1130)
+
+#### 5.3 管理后台查看
+
+`ChannelsAdmin` 提供了错误状态的筛选和显示：
+
+```python
+class ChannelsAdmin(ModelAdmin[Channel]):
+    list_display = (
+        "id",
+        "transport",
+        "name",
+        "project_",
+        "created_",
+        "chopped_value",
+        "last",
+        "status",      # 显示状态：Disabled / Error / OK / -
+        "time",
+    )
+    list_filter = ("kind", LastNotifyDurationFilter, LastErrorFilter, "disabled")
+    ...
+    
+    @mark_safe
+    def status(self, obj: Channel) -> str:
+        if obj.disabled:
+            return "<span class='d'>Disabled</span>"
+        if obj.last_error:
+            return "<span class='e'>Error</span>"
+        if obj.last_notify:
+            return "OK"
+        return "-"
+```
+[hc/api/admin.py:194-265](hc/api/admin.py#L194-L265)
+
+### 6. 第三层：人工恢复
+
+#### 6.1 没有内置自动重发机制
+
+系统中**没有**以下机制**：
+- 没有 `resend` 管理命令
+- 没有重置 `Flip.processed` 的代码
+- 没有定时任务检查失败的通知并重发
+
+#### 6.2 人工恢复步骤
+
+1. **查看错误信息**：
+   - 通过 Django 管理后台查看 `Notification.error` 和 `Channel.last_error`
+   - 查看日志了解失败原因（网络错误、配置错误、永久性错误等）
+
+2. **修复问题**：
+   - 如果是配置错误：更新 Webhook URL、重新验证邮箱等
+   - 如果是网络问题：修复网络连接
+   - 如果是第三方服务问题：等待服务恢复
+
+3. **重新启用渠道**（如果被禁用）：
+   - 通过管理后台将 `Channel.disabled` 设为 `False`
+   - 或者通过 API 更新
+
+4. **验证渠道**：
+   - 使用 "Test!" 按钮发送测试通知验证配置是否修复
+
+5. **等待下一次通知**：
+   - 由于 `Flip` 已标记为已处理，**不会自动重发**
+   - 只能等待下一次状态变化（up → down 或 down → up）触发新的 `Flip`
+
+#### 6.3 手动触发重发的替代方案
+
+如果必须手动重发某次失败的通知，可以：
+
+1. **手动操作数据库（不推荐）：
+   ```sql
+   -- 重置 Flip.processed 为 null（需要非常谨慎操作
+   UPDATE api_flip SET processed = NULL WHERE id = xxx;
+   ```
+
+2. **通过管理界面操作：
+   - 使用 "Test!" 按钮可以验证配置
+   - 手动暂停/恢复检查触发新的状态变化
+
+### 7. 测试通知与正式通知的重试差异
 
 **重要修正**：只有 **Webhook 渠道**明确实现了测试通知不重试的逻辑，其他渠道没有这个差异。
 
-#### 3.1 Webhook 渠道的重试差异
+#### 7.1 Webhook 渠道的重试差异
 
 Webhook 渠道通过检查 `notification.owner is None` 来判断是否是测试通知：
 
@@ -384,7 +659,7 @@ def notify(self, flip: Flip, is_test: bool = False) -> str:
 ```
 [hc/api/models.py:1098-1130](hc/api/models.py#L1098-L1130)
 
-#### 3.2 其他渠道的重试行为
+#### 7.2 其他渠道的重试行为
 
 **其他渠道（Slack、Telegram、SMS、Signal、Email 等）没有检查 `notification.owner` 来判断是否是测试通知**，它们的重试行为在测试通知和正式通知中是相同的。
 
@@ -395,82 +670,16 @@ def notify(self, flip: Flip, is_test: bool = False) -> str:
 - **Email**：独立的重试逻辑，不区分测试/正式
 - **Signal**：独立的重试逻辑，不区分测试/正式
 
-### 4. 渠道特定的重试机制
-
-#### 4.1 邮件重试机制
-
-邮件发送有独立的重试逻辑，不区分测试通知和正式通知：
-
-```python
-class EmailThread(Thread):
-    MAX_TRIES = 3
-
-    def run(self) -> None:
-        for attempt in range(0, self.MAX_TRIES):
-            try:
-                # 确保每次重试都创建新连接
-                self.message.connection = None
-                self.message.send()
-                # 没有异常，退出重试循环
-                return
-            except (SMTPServerDisconnected, SMTPDataError) as e:
-                if attempt + 1 == self.MAX_TRIES:
-                    # 这是最后一次尝试，失败后重新抛出异常
-                    raise e
-
-                # 等待 1 秒后重试
-                time.sleep(1)
-```
-[hc/lib/emails.py:15-37](hc/lib/emails.py#L15-L37)
-
-#### 4.2 Signal 重试机制
-
-Signal 通知有独立的重试逻辑，不区分测试通知和正式通知：
-
-```python
-def notify(self, flip: Flip, notification: Notification) -> None:
-    ...
-    # Signal 最多重试 2 次
-    tries_left = 2
-    while True:
-        try:
-            return self.send(self.channel.phone.value, text)
-        except SignalRateLimitFailure as e:
-            # 速率限制错误，发送提醒邮件
-            self.channel.send_signal_captcha_alert(e.token, e.reply.decode())
-            plaintext, _ = extract_signal_styles(text)
-            self.channel.send_signal_rate_limited_notice(text, plaintext)
-            raise e
-        except TransportError as e:
-            tries_left -= 1
-            # 永久性错误或重试次数用完，则抛出异常
-            if e.permanent or tries_left == 0:
-                raise e
-            logger.debug("Retrying signal-cli call")
-```
-[hc/integrations/signal/transport.py:158-188](hc/integrations/signal/transport.py#L158-L188)
-
-### 5. 永久性错误处理
+### 8. 永久性错误处理
 
 某些错误被标记为永久性错误，会导致渠道被自动禁用：
 
-#### 5.1 Telegram 永久性错误
+#### 8.1 Telegram 永久性错误
 
 ```python
 @classmethod
 def raise_for_response(cls, response: curl.Response) -> NoReturn:
-    message = f"Received status code {response.status_code}"
-    try:
-        m = Telegram.ErrorModel.model_validate_json(response.content)
-    except ValidationError:
-        raise TransportError(message)
-
-    if m.parameters:
-        # 如果错误 payload 包含 migrate_to_chat_id 字段
-        # 抛出 MigrationRequiredError，包含新的 chat_id
-        chat_id = m.parameters.migrate_to_chat_id
-        raise MigrationRequiredError(m.description, chat_id)
-
+    ...
     permanent = False
     message += f' with a message: "{m.description}"'
     
@@ -486,7 +695,7 @@ def raise_for_response(cls, response: curl.Response) -> NoReturn:
 ```
 [hc/integrations/telegram/transport.py:28-51](hc/integrations/telegram/transport.py#L28-L51)
 
-#### 5.2 Slack 永久性错误
+#### 8.2 Slack 永久性错误
 
 ```python
 @classmethod
@@ -500,7 +709,6 @@ def raise_for_response(cls, response: curl.Response) -> NoReturn:
     elif response.status_code == 400:
         if response.content == b"invalid_token":
             # 使用已停用用户的令牌发送到私有频道
-            # 理论上可以恢复，但实践中不太可能
             permanent = True
         else:
             logger.debug("Slack returned HTTP 400 with body: %s", response.content)
@@ -509,7 +717,7 @@ def raise_for_response(cls, response: curl.Response) -> NoReturn:
 ```
 [hc/integrations/slack/transport.py:93-112](hc/integrations/slack/transport.py#L93-L112)
 
-#### 5.3 SMS 永久性错误
+#### 8.3 SMS 永久性错误
 
 ```python
 @classmethod
@@ -529,55 +737,9 @@ def raise_for_response(cls, response: curl.Response) -> NoReturn:
 ```
 [hc/integrations/sms/transport.py:23-34](hc/integrations/sms/transport.py#L23-L34)
 
-### 6. 错误记录和渠道禁用
+### 9. 特殊错误处理
 
-`Channel.notify()` 方法处理错误记录和渠道禁用：
-
-```python
-def notify(self, flip: Flip, is_test: bool = False) -> str:
-    # 如果渠道应该忽略此状态，返回 no-op
-    if self.transport.is_noop(flip.new_status):
-        return "no-op"
-
-    # 创建 Notification 记录
-    n = Notification(channel=self)
-    if is_test:
-        # 测试通知时，owner 字段为 null
-        pass
-    else:
-        n.owner = flip.owner
-
-    n.check_status = flip.new_status
-    n.error = "Sending"
-    n.save()
-
-    start, error, disabled = now(), "", self.disabled
-    try:
-        self.transport.notify(flip, notification=n)
-
-    except transports.TransportError as e:
-        # 永久性错误会禁用渠道
-        disabled = True if e.permanent else disabled
-        error = e.message
-
-    # 更新 Notification 错误信息
-    Notification.objects.filter(id=n.id).update(error=error)
-    
-    # 更新 Channel 状态
-    Channel.objects.filter(id=self.id).update(
-        last_notify=start,
-        last_notify_duration=now() - start,
-        last_error=error,
-        disabled=disabled,
-    )
-
-    return error
-```
-[hc/api/models.py:1098-1130](hc/api/models.py#L1098-L1130)
-
-### 7. 特殊错误处理
-
-#### 7.1 速率限制处理
+#### 9.1 速率限制处理
 
 Telegram 和 Signal 都有速率限制处理：
 
@@ -591,7 +753,7 @@ def notify(self, flip: Flip, notification: Notification) -> None:
 ```
 [hc/integrations/telegram/transport.py:65-69](hc/integrations/telegram/transport.py#L65-L69)
 
-#### 7.2 特殊迁移处理
+#### 9.2 特殊迁移处理
 
 Telegram 支持群组迁移后的自动更新：
 
@@ -606,7 +768,7 @@ def notify(self, flip: Flip, notification: Notification) -> None:
 ```
 [hc/integrations/telegram/transport.py:84-89](hc/integrations/telegram/transport.py#L84-L89)
 
-#### 7.3 配额超限处理
+#### 9.3 配额超限处理
 
 SMS 有月度配额限制：
 
@@ -636,16 +798,23 @@ def notify(self, flip: Flip, notification: Notification) -> None:
 - **并发处理**：使用 `ThreadPoolExecutor` 处理多个检查的告警
 - **智能选择**：`select_channels()` 方法根据状态、禁用状态、noop 标志过滤渠道
 - **默认并发度**：`--num-workers` 参数默认值为 **1**（不是 10）
+- **同一检查的多渠道**：顺序处理，不是并发
 
-### 失败处理逻辑
-- **通用重试**：`HttpTransport` 实现最多 3 次重试，永久性错误不重试
-- **渠道特定重试**：Email（3次，间隔1秒）、Signal（2次）
-- **测试通知与正式通知的重试差异**：
-  - **只有 Webhook 渠道**：测试通知 `retry=False`（不重试），正式通知 `retry=True`（最多3次重试）
-  - **其他渠道**：不区分测试通知和正式通知，重试行为相同
-- **永久性错误**：某些错误（如用户拉黑、群组删除、无效号码）会自动禁用渠道
-- **错误记录**：错误信息记录在 `Notification.error` 和 `Channel.last_error`
-- **特殊处理**：速率限制、配额超限、Telegram 群组迁移等场景有专门处理
+### 失败处理核心机制
+- **告警发送前标记为已处理**：`Flip.processed` 在通知发送前就被设置
+- **不会自动再次分发**：`sendalerts` 只查询 `processed=None` 的记录，没有重置机制
+- **三层防御体系**：
+  1. **渠道内部重试**：HttpTransport（3次）、Email（3次，间隔1秒）、Signal（2次）
+  2. **错误状态落库**：`Notification.error`、`Channel.last_error`、`Channel.disabled`
+  3. **人工恢复**：查看错误、修复问题、重新启用渠道、等待下一次状态变化
+
+### 测试通知与正式通知的重试差异
+- **只有 Webhook 渠道**：测试通知 `retry=False`（不重试），正式通知 `retry=True`（最多3次重试）
+- **其他渠道**：不区分测试通知和正式通知，重试行为相同
+
+### 永久性错误
+- 某些错误（如用户拉黑、群组删除、无效号码）会自动禁用渠道
+- 禁用后需要人工重新启用
 
 ---
 
@@ -667,3 +836,9 @@ def notify(self, flip: Flip, notification: Notification) -> None:
    - 不同检查之间是并发处理的（通过 `ThreadPoolExecutor`）
    - 同一检查的不同渠道之间是顺序处理的（通过 `for` 循环）
    - 并发度控制的是同时处理多少个**检查**，而不是同一个检查的多少个**渠道**
+
+4. **失败处理深入分析**（新增）：
+   - **告警发送前标记为已处理**：`Flip.processed` 在通知发送前就被设置
+   - **为什么不会自动再次分发**：`sendalerts` 只查询 `processed=None` 的记录，没有重置机制
+   - **三层防御体系**：渠道内部重试 → 错误状态落库 → 人工恢复
+   - **人工恢复步骤**：查看错误、修复问题、重新启用渠道、等待下一次状态变化
